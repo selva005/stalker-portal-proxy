@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY config.py stalker_client.py m3u.py main.py ./
+COPY config.py stalker_client.py main.py ./
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser
 USER appuser

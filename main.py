@@ -41,8 +41,14 @@ async def _get_valid_session():
         return await client.get_session(force_refresh=True)
 
 
-@app.get("/stalker_portal/server/load.php")
-async def load_php(request: Request):
+@app.api_route("/{path:path}", methods=["GET", "POST", "HEAD"])
+async def catch_all(request: Request, path: str):
+    """Single entry point for every request the STB app might send.
+
+    Different STB emulator apps disagree on whether the configured Portal URL
+    already includes the `/stalker_portal` prefix, so routing here is done by
+    query params (`type`/`action`), not by matching a literal path.
+    """
     params = request.query_params
     req_type = params.get("type", "")
     action = params.get("action", "")
@@ -62,14 +68,20 @@ async def load_php(request: Request):
     return await _proxy(request)
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "HEAD"])
-async def catch_all(request: Request, path: str):
-    return await _proxy(request)
+def _upstream_path(request_path: str) -> str:
+    """Normalize the request path to the real portal's actual base path.
+
+    Some STB apps are configured with a bare Portal URL and don't prepend
+    `/stalker_portal` themselves when building requests.
+    """
+    if request_path.startswith("/stalker_portal"):
+        return request_path
+    return f"/stalker_portal{request_path}"
 
 
 async def _proxy(request: Request) -> Response:
     session = await _get_valid_session()
-    url = f"{UPSTREAM_BASE}{request.url.path}"
+    url = f"{UPSTREAM_BASE}{_upstream_path(request.url.path)}"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _EXCLUDED_REQUEST_HEADERS}
     headers["Cookie"] = f"mac={config.mac_address}; stb_lang=en; timezone=GMT"
     headers["Authorization"] = f"Bearer {session.token}"
