@@ -1,14 +1,17 @@
-# Stalker-to-M3U
+# Stalker-Portal Proxy
 
-Converts a Stalker-Portal account (MAC-based IPTV portal) into an M3U playlist usable in
-TiviMate, OTT Navigator, VLC, Perfect Player, etc. FastAPI app deployable via Docker.
+A transparent reverse proxy for a Stalker-Portal account (MAC-based IPTV portal). Point
+your MAG/Stalker-emulator STB apps at this proxy instead of the real portal, and they all
+share one real authenticated account — full native app support (live TV, VOD, series, EPG,
+whatever your account/app supports), no per-device MAC whitelisting needed.
 
-## Features
+## How it works
 
-- Authenticates to any Stalker-Portal using MAC address, serial number, and device IDs
-- Generates a dynamic M3U playlist directly from the portal (channels, genres, account info)
-- Redirects to direct stream URLs for any channel
-- Auto-detects and displays the requesting client's IP in the playlist info rows
+Auth requests (`handshake`, `get_profile`, `account_info`) are answered directly from one
+cached, real session, so every connected device gets the same identity — this avoids
+repeated re-handshakes upstream invalidating each other's tokens. Every other request
+(channel/VOD/series listings, EPG, images, stream links) is forwarded to the real portal
+verbatim, with the real account's credentials injected.
 
 ## Configuration
 
@@ -29,11 +32,14 @@ Optional: `STALKER_DEVICE_ID`, `STALKER_DEVICE_ID2` (some portals don't require 
 docker compose up --build
 ```
 
-Then load the playlist in your IPTV player at:
+On each TV's STB emulator app, set the Portal URL to:
 
 ```
-http://<host>:8000/playlist.m3u8
+http://<homeserver-lan-ip>:8000/
 ```
+
+MAC/device ID settings on each TV no longer matter — auth is handled entirely by the
+proxy using the real account's credentials.
 
 ## Run locally without Docker
 
@@ -43,13 +49,9 @@ export $(cat .env | xargs)
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-## Endpoints
-
-- `GET /playlist.m3u8` — full M3U playlist (channels + account info rows)
-- `GET /{channel_id}.m3u8` — 302-redirects to the live stream URL for that channel
-
 ## Notes
 
 - The portal session (token/profile/account info) is cached in memory and only
-  re-authenticated when a portal call fails, avoiding a full re-auth on every request.
+  re-authenticated when a portal call fails, avoiding repeated handshakes upstream.
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
+- Intended for LAN use across your own devices on your own account.

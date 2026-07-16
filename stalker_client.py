@@ -36,7 +36,7 @@ class StalkerClient:
         self.hw_version = "1.7-BD-" + _md5(config.mac_address)[:2].upper()
         self.hw_version_2 = _md5(config.serial_number.lower() + config.mac_address.lower())
         self._session: Optional[Session] = None
-        self._http = httpx.AsyncClient(timeout=15.0)
+        self.http = httpx.AsyncClient(timeout=15.0)
 
     def _headers(self, token: str = "") -> dict:
         headers = {
@@ -54,7 +54,7 @@ class StalkerClient:
 
     async def _get_json(self, url: str, token: str = "") -> Any:
         try:
-            response = await self._http.get(url, headers=self._headers(token))
+            response = await self.http.get(url, headers=self._headers(token))
         except httpx.HTTPError as e:
             raise PortalError(f"Request failed: {e}") from e
         if response.status_code != 200:
@@ -119,34 +119,6 @@ class StalkerClient:
         data = await self._get_json(url, token)
         return data.get("js") or {}
 
-    async def get_genres(self, token: str) -> list:
-        url = (
-            f"http://{self.config.host}/stalker_portal/server/load.php"
-            "?type=itv&action=get_genres&JsHttpRequest=1-xml"
-        )
-        data = await self._get_json(url, token)
-        return data.get("js") or []
-
-    async def get_all_channels(self, token: str) -> list:
-        url = (
-            f"http://{self.config.host}/stalker_portal/server/load.php"
-            "?type=itv&action=get_all_channels&JsHttpRequest=1-xml"
-        )
-        data = await self._get_json(url, token)
-        return ((data.get("js") or {}).get("data")) or []
-
-    async def create_link(self, channel_id: str, token: str) -> str:
-        url = (
-            f"http://{self.config.host}/stalker_portal/server/load.php"
-            f"?type=itv&action=create_link&cmd=ffrt%20http://localhost/ch/{channel_id}"
-            "&JsHttpRequest=1-xml"
-        )
-        data = await self._get_json(url, token)
-        cmd = (data.get("js") or {}).get("cmd", "")
-        if not cmd:
-            raise PortalError(f"No stream URL for channel {channel_id}")
-        return cmd
-
     async def _authenticate(self) -> Session:
         logger.info("Authenticating with portal %s", self.config.host)
         token = await self._get_token()
@@ -165,4 +137,4 @@ class StalkerClient:
         self._session = None
 
     async def close(self) -> None:
-        await self._http.aclose()
+        await self.http.aclose()
