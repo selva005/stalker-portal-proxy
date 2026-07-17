@@ -43,6 +43,13 @@ http://<homeserver-lan-ip>:8000/
 MAC/device ID settings on each TV no longer matter — auth is handled entirely by the
 proxy using the real account's credentials.
 
+### Filtered vs. unfiltered endpoint
+
+- `http://<homeserver-lan-ip>:8000/` — category filtering applied (per `BLOCKED_CATEGORY_NAMES`).
+- `http://<homeserver-lan-ip>:8000/unfiltered/` — same account, same session, but never
+  filters category listings. Point a specific TV/profile here if you want the full,
+  unfiltered catalog on that device.
+
 ## Run locally without Docker
 
 ```bash

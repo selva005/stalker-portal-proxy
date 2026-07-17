@@ -63,6 +63,11 @@ async def _get_valid_session():
         return await client.get_session(force_refresh=True)
 
 
+# Requests under this prefix skip category filtering entirely, e.g. an STB app
+# pointed at http://host:8000/unfiltered/ gets the raw, unfiltered catalog.
+UNFILTERED_PREFIX = "/unfiltered"
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "HEAD"])
 async def catch_all(request: Request, path: str):
     """Single entry point for every request the STB app might send.
@@ -87,7 +92,13 @@ async def catch_all(request: Request, path: str):
         session = await _get_valid_session()
         return JSONResponse({"js": session.account_info})
 
-    return await _proxy(request)
+    filtered = True
+    effective_path = request.url.path
+    if effective_path == UNFILTERED_PREFIX or effective_path.startswith(UNFILTERED_PREFIX + "/"):
+        filtered = False
+        effective_path = effective_path[len(UNFILTERED_PREFIX):] or "/"
+
+    return await _proxy(request, effective_path, filtered)
 
 
 def _upstream_path(request_path: str) -> str:
@@ -101,9 +112,9 @@ def _upstream_path(request_path: str) -> str:
     return f"/stalker_portal{request_path}"
 
 
-async def _proxy(request: Request) -> Response:
+async def _proxy(request: Request, effective_path: str, filtered: bool) -> Response:
     session = await _get_valid_session()
-    url = f"{UPSTREAM_BASE}{_upstream_path(request.url.path)}"
+    url = f"{UPSTREAM_BASE}{_upstream_path(effective_path)}"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _EXCLUDED_REQUEST_HEADERS}
     headers["Cookie"] = f"mac={config.mac_address}; stb_lang=en; timezone=GMT"
     headers["Authorization"] = f"Bearer {session.token}"
@@ -135,7 +146,12 @@ async def _proxy(request: Request) -> Response:
 
     content = response.content
     action = request.query_params.get("action", "")
-    if config.blocked_category_names and action in _CATEGORY_LISTING_ACTIONS and response.status_code == 200:
+    if (
+        filtered
+        and config.blocked_category_names
+        and action in _CATEGORY_LISTING_ACTIONS
+        and response.status_code == 200
+    ):
         content = _filter_categories(content)
 
     response_headers = {
