@@ -24,6 +24,11 @@ class Config:
         self.stb_type = os.environ.get("STALKER_STB_TYPE", "MAG250")
         self.api_signature = os.environ.get("STALKER_API_SIGNATURE", "263")
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
+        self.blocked_category_names = [
+            name.strip().lower()
+            for name in os.environ.get("BLOCKED_CATEGORY_NAMES", "").split(",")
+            if name.strip()
+        ]
 
 
 try:

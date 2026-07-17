@@ -24,7 +24,9 @@ cp .env.example .env
 Required: `STALKER_HOST`, `STALKER_MAC`, `STALKER_SERIAL`.
 Optional: `STALKER_DEVICE_ID`, `STALKER_DEVICE_ID2` (some portals don't require them),
 `STALKER_STB_TYPE` (default `MAG250`), `STALKER_API_SIGNATURE` (default `263`),
-`LOG_LEVEL` (default `INFO`).
+`LOG_LEVEL` (default `INFO`), `BLOCKED_CATEGORY_NAMES` (comma-separated, case-insensitive
+substrings to hide from live TV genre / VOD category / series category listings, e.g.
+`ADULT,XXX`).
 
 ## Run with Docker Compose
 

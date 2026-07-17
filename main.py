@@ -5,6 +5,7 @@ downstream STB app (regardless of its own MAC/device settings) shares the same
 upstream identity. Everything else is forwarded to the real portal verbatim, with
 the real account's credentials injected.
 """
+import json
 import logging
 
 import httpx
@@ -31,6 +32,27 @@ _EXCLUDED_RESPONSE_HEADERS = {"content-encoding", "content-length", "transfer-en
 _EXCLUDED_REQUEST_HEADERS = {
     "host", "content-length", "transfer-encoding", "connection", "authorization", "cookie",
 }
+
+# Actions that return a category/genre listing (live TV genres, VOD categories, series
+# categories all share this response shape: {"js": [{"id", "title", ...}, ...]}).
+_CATEGORY_LISTING_ACTIONS = {"get_genres", "get_categories"}
+
+
+def _is_blocked_category(title: str) -> bool:
+    title_lower = title.lower()
+    return any(blocked in title_lower for blocked in config.blocked_category_names)
+
+
+def _filter_categories(body: bytes) -> bytes:
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body
+    categories = data.get("js")
+    if not isinstance(categories, list):
+        return body
+    data["js"] = [c for c in categories if not _is_blocked_category(c.get("title", ""))]
+    return json.dumps(data).encode()
 
 
 async def _get_valid_session():
@@ -111,11 +133,16 @@ async def _proxy(request: Request) -> Response:
     if response.status_code >= 500:
         client.invalidate_session()
 
+    content = response.content
+    action = request.query_params.get("action", "")
+    if config.blocked_category_names and action in _CATEGORY_LISTING_ACTIONS and response.status_code == 200:
+        content = _filter_categories(content)
+
     response_headers = {
         k: v for k, v in response.headers.items() if k.lower() not in _EXCLUDED_RESPONSE_HEADERS
     }
     return Response(
-        content=response.content,
+        content=content,
         status_code=response.status_code,
         headers=response_headers,
         media_type=response.headers.get("content-type"),
