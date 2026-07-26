@@ -6,8 +6,10 @@ upstream identity. Everything else is forwarded to the real portal verbatim, wit
 the real account's credentials injected.
 """
 import asyncio
+import base64
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from urllib.parse import urlencode
@@ -61,6 +63,52 @@ _listing_cache: dict[str, _CacheEntry] = {}
 
 def _cache_key(upstream_path: str, items) -> str:
     return f"{upstream_path}?{urlencode(sorted(items))}"
+
+
+def _save_cache_to_disk() -> None:
+    """Persist the in-memory cache so a container restart doesn't start cold."""
+    try:
+        cache_dir = os.path.dirname(config.cache_file_path)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+        serializable = {
+            key: {
+                "status_code": entry.status_code,
+                "content_type": entry.content_type,
+                "content_b64": base64.b64encode(entry.content).decode("ascii"),
+                "expires_at": entry.expires_at,
+            }
+            for key, entry in _listing_cache.items()
+        }
+        tmp_path = config.cache_file_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(serializable, f)
+        os.replace(tmp_path, config.cache_file_path)
+        logger.info("Persisted %d cache entries to %s", len(serializable), config.cache_file_path)
+    except OSError as e:
+        logger.warning("Failed to persist cache to disk: %s", e)
+
+
+def _load_cache_from_disk() -> None:
+    try:
+        with open(config.cache_file_path) as f:
+            serializable = json.load(f)
+    except (OSError, ValueError):
+        return
+    loaded = 0
+    for key, entry in serializable.items():
+        try:
+            content = base64.b64decode(entry["content_b64"])
+        except (KeyError, ValueError):
+            continue
+        _listing_cache[key] = _CacheEntry(
+            status_code=entry["status_code"],
+            content_type=entry["content_type"],
+            content=content,
+            expires_at=entry["expires_at"],
+        )
+        loaded += 1
+    logger.info("Loaded %d cache entries from %s", loaded, config.cache_file_path)
 
 
 def _is_blocked_category(title: str) -> bool:
@@ -147,62 +195,111 @@ def _apply_filter_if_needed(content: bytes, action: str, filtered: bool) -> byte
     return content
 
 
-# Category/genre listings are cheap (one call each) and shared by every sync, so they're
-# worth pre-warming proactively rather than waiting for the first client request. Full
-# per-category item listings are NOT pre-warmed here: this account's catalog is large
-# enough (one VOD category alone had 36,000+ items at ~14/page) that blindly crawling
-# every page of every category would take a very long time and risk re-triggering the
-# portal's rate limiting. Those stay reactively cached (populated as the app requests them).
-_PREWARM_ENDPOINTS = [
+# Live TV is small enough (genres + one get_all_channels call) to fully auto-sync in the
+# background. VOD/series catalogs are large (one category alone had 36,000+ items at
+# ~14/page), so only their categories plus the first PREWARM_VOD_SERIES_PAGES pages of
+# each category are pre-warmed -- full per-category crawling would take a long time and
+# risks re-triggering the portal's rate limiting. Everything beyond that stays reactively
+# cached (populated as the TV app actually requests it).
+_LIVE_TV_PREWARM_ENDPOINTS = [
     ("itv", "get_genres"),
+    ("itv", "get_all_channels"),
+]
+_CATALOG_PREWARM_ENDPOINTS = [
     ("vod", "get_categories"),
     ("series", "get_categories"),
 ]
 
 
-async def _prewarm_categories() -> None:
+def _parse_category_ids(content: bytes) -> list[str]:
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return []
+    categories = data.get("js")
+    if not isinstance(categories, list):
+        return []
+    return [str(c["id"]) for c in categories if c.get("id") is not None]
+
+
+async def _fetch_and_cache(headers: dict, params: list[tuple[str, str]]) -> bytes | None:
+    url = f"{UPSTREAM_BASE}/stalker_portal/server/load.php"
+    try:
+        response = await client.http.get(url, params=params, headers=headers)
+    except httpx.HTTPError as e:
+        logger.warning("Pre-warm request failed for %s: %s", params, e)
+        return None
+    if response.status_code != 200:
+        logger.warning("Pre-warm got status %s for %s", response.status_code, params)
+        return None
+    key = _cache_key("/stalker_portal/server/load.php", params)
+    _listing_cache[key] = _CacheEntry(
+        status_code=response.status_code,
+        content_type=response.headers.get("content-type"),
+        content=response.content,
+        expires_at=time.time() + config.listing_cache_ttl_seconds,
+    )
+    return response.content
+
+
+async def _prewarm_all() -> None:
     try:
         session = await _get_valid_session()
     except PortalError as e:
-        logger.warning("Skipping category pre-warm: %s", e)
+        logger.warning("Skipping pre-warm: %s", e)
         return
 
     headers = {
         "Cookie": f"mac={config.mac_address}; stb_lang=en; timezone=GMT",
         "Authorization": f"Bearer {session.token}",
     }
-    for req_type, action in _PREWARM_ENDPOINTS:
-        params = [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")]
-        url = f"{UPSTREAM_BASE}/stalker_portal/server/load.php"
-        try:
-            response = await client.http.get(url, params=params, headers=headers)
-        except httpx.HTTPError as e:
-            logger.warning("Pre-warm failed for type=%s action=%s: %s", req_type, action, e)
-            continue
-        if response.status_code != 200:
-            logger.warning(
-                "Pre-warm got status %s for type=%s action=%s", response.status_code, req_type, action
-            )
-            continue
-        key = _cache_key("/stalker_portal/server/load.php", params)
-        _listing_cache[key] = _CacheEntry(
-            status_code=response.status_code,
-            content_type=response.headers.get("content-type"),
-            content=response.content,
-            expires_at=time.time() + config.listing_cache_ttl_seconds,
+
+    for req_type, action in _LIVE_TV_PREWARM_ENDPOINTS:
+        await _fetch_and_cache(headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")])
+        logger.info("Pre-warmed live TV: type=%s action=%s", req_type, action)
+        await asyncio.sleep(config.prewarm_delay_seconds)
+
+    for req_type, action in _CATALOG_PREWARM_ENDPOINTS:
+        content = await _fetch_and_cache(
+            headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")]
         )
-        logger.info("Pre-warmed cache for type=%s action=%s", req_type, action)
+        logger.info("Pre-warmed categories: type=%s action=%s", req_type, action)
+        await asyncio.sleep(config.prewarm_delay_seconds)
+
+        if not content:
+            continue
+        category_ids = _parse_category_ids(content)
+        for category_id in category_ids:
+            for page in range(1, config.prewarm_vod_series_pages + 1):
+                await _fetch_and_cache(
+                    headers,
+                    [
+                        ("type", req_type),
+                        ("action", "get_ordered_list"),
+                        ("category", category_id),
+                        ("p", str(page)),
+                        ("JsHttpRequest", "1-xml"),
+                    ],
+                )
+                await asyncio.sleep(config.prewarm_delay_seconds)
+        logger.info(
+            "Pre-warmed first %d page(s) of %d %s categories",
+            config.prewarm_vod_series_pages, len(category_ids), req_type,
+        )
+
+    _save_cache_to_disk()
 
 
 async def _prewarm_loop() -> None:
     while True:
         await asyncio.sleep(config.listing_cache_ttl_seconds)
-        await _prewarm_categories()
+        await _prewarm_all()
 
 
 @app.on_event("startup")
 async def startup() -> None:
-    await _prewarm_categories()
+    _load_cache_from_disk()
+    asyncio.create_task(_prewarm_all())
     asyncio.create_task(_prewarm_loop())
 
 
@@ -272,4 +369,5 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
 
 @app.on_event("shutdown")
 async def shutdown():
+    _save_cache_to_disk()
     await client.close()

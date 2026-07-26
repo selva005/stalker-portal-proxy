@@ -30,6 +30,9 @@ class Config:
             if name.strip()
         ]
         self.listing_cache_ttl_seconds = float(os.environ.get("LISTING_CACHE_TTL_SECONDS", "21600"))
+        self.prewarm_delay_seconds = float(os.environ.get("PREWARM_DELAY_SECONDS", "0.3"))
+        self.prewarm_vod_series_pages = int(os.environ.get("PREWARM_VOD_SERIES_PAGES", "3"))
+        self.cache_file_path = os.environ.get("CACHE_FILE_PATH", "/data/cache.json")
 
 
 try:

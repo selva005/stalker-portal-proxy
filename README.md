@@ -27,8 +27,10 @@ Optional: `STALKER_DEVICE_ID`, `STALKER_DEVICE_ID2` (some portals don't require 
 `LOG_LEVEL` (default `INFO`), `BLOCKED_CATEGORY_NAMES` (comma-separated, case-insensitive
 substrings to hide from live TV genre / VOD category / series category listings, e.g.
 `ADULT,XXX`), `LISTING_CACHE_TTL_SECONDS` (default `21600` / 6 hours, how long to cache
-genre/category/channel/VOD/series listing responses, and how often genre/category
-listings are refreshed in the background).
+listing responses and how often the background auto-sync re-runs), `PREWARM_DELAY_SECONDS`
+(default `0.3`, delay between requests during auto-sync), `PREWARM_VOD_SERIES_PAGES`
+(default `3`, how many pages of each VOD/series category to auto-sync), `CACHE_FILE_PATH`
+(default `/data/cache.json`, where the cache is persisted across restarts).
 
 ## Run with Docker Compose
 
@@ -69,12 +71,17 @@ uvicorn main:app --host 0.0.0.0 --port 8000
   app refreshes. Stream links (`create_link`) and EPG are never cached. The filtered and
   `/unfiltered/` endpoints share the same underlying cache entry — filtering is applied
   fresh on each response, not baked into the cached data.
-- Live TV genres and VOD/series categories are proactively pre-warmed on startup and
-  refreshed in the background every `LISTING_CACHE_TTL_SECONDS`, so those load instantly
-  rather than waiting for a TV app to trigger the first fetch. Full per-category item
-  listings (e.g. every page of every VOD category) are intentionally **not** pre-warmed —
-  large catalogs (tens of thousands of items per category) make a blind full crawl slow
-  and risk re-triggering the portal's rate limiting. Those stay reactively cached as your
-  TV app actually requests them.
+- **Background auto-sync**, on startup and every `LISTING_CACHE_TTL_SECONDS` after that,
+  regardless of whether any TV is in use:
+  - Live TV: genres and the full channel list are fully synced (small enough to do so).
+  - VOD/series: categories, plus the first `PREWARM_VOD_SERIES_PAGES` pages of every
+    category. Full catalogs are too large to sync entirely (one category alone had
+    36,000+ items at ~14/page) — full crawling would take a long time and risks
+    re-triggering the portal's rate limiting. Anything beyond the pre-synced pages stays
+    reactively cached as your TV app actually requests it.
+- **Cache persistence**: the cache is saved to `CACHE_FILE_PATH` after each auto-sync and
+  on shutdown, and reloaded on startup — a container restart doesn't start cold. Backed by
+  the `cache_data` Docker volume in `docker-compose.yml`, so it survives
+  `docker compose down`/`up` (not just a process restart).
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
 - Intended for LAN use across your own devices on your own account.

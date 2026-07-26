@@ -5,4 +5,9 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    volumes:
+      - cache_data:/data
     restart: unless-stopped
+
+volumes:
+  cache_data:
