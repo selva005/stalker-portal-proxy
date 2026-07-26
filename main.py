@@ -43,6 +43,19 @@ _EXCLUDED_REQUEST_HEADERS = {
 # categories all share this response shape: {"js": [{"id", "title", ...}, ...]}).
 _CATEGORY_LISTING_ACTIONS = {"get_genres", "get_categories"}
 
+# Actions that return actual channel/item entries, each tagged with the category/genre
+# they belong to. Blocking a category from the listing above does NOT stop these from
+# still containing items in that category -- both need filtering for a category to
+# actually disappear from what the app can see, not just lose its display name.
+_ITEM_LISTING_FIELDS = {
+    "get_all_channels": "tv_genre_id",
+    "get_ordered_list": "category_id",
+}
+
+# Populated from whatever category/genre listing content has been seen (fresh or cached),
+# keyed by portal type ("itv", "vod", "series") -> set of blocked category ids.
+_blocked_category_ids: dict[str, set] = {}
+
 # Read-heavy, slow-changing listing actions worth caching to cut down on repeated
 # portal hits from multiple TVs (or repeated app refreshes) requesting the same data.
 # Stream links (create_link) and EPG are intentionally excluded, since they're either
@@ -116,6 +129,28 @@ def _is_blocked_category(title: str) -> bool:
     return any(blocked in title_lower for blocked in config.blocked_category_names)
 
 
+def _update_blocked_category_ids(req_type: str, content: bytes) -> None:
+    """Record which category ids are blocked, so item listings can filter by id too.
+
+    Called for every category/genre listing seen (cache hit or fresh fetch), regardless
+    of whether the current request is filtered or not, so the mapping is always kept
+    current from whichever source populated it first.
+    """
+    if not config.blocked_category_names:
+        return
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return
+    categories = data.get("js")
+    if not isinstance(categories, list):
+        return
+    _blocked_category_ids[req_type] = {
+        str(c["id"]) for c in categories
+        if c.get("id") is not None and _is_blocked_category(c.get("title", ""))
+    }
+
+
 def _filter_categories(body: bytes) -> bytes:
     try:
         data = json.loads(body)
@@ -125,6 +160,22 @@ def _filter_categories(body: bytes) -> bytes:
     if not isinstance(categories, list):
         return body
     data["js"] = [c for c in categories if not _is_blocked_category(c.get("title", ""))]
+    return json.dumps(data).encode()
+
+
+def _filter_items(content: bytes, req_type: str, id_field: str) -> bytes:
+    blocked_ids = _blocked_category_ids.get(req_type)
+    if not blocked_ids:
+        return content
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return content
+    js = data.get("js")
+    items = js.get("data") if isinstance(js, dict) else None
+    if not isinstance(items, list):
+        return content
+    js["data"] = [item for item in items if str(item.get(id_field)) not in blocked_ids]
     return json.dumps(data).encode()
 
 
@@ -189,9 +240,14 @@ def _upstream_path(request_path: str) -> str:
     return f"/stalker_portal{request_path}"
 
 
-def _apply_filter_if_needed(content: bytes, action: str, filtered: bool) -> bytes:
-    if filtered and config.blocked_category_names and action in _CATEGORY_LISTING_ACTIONS:
-        return _filter_categories(content)
+def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered: bool) -> bytes:
+    if action in _CATEGORY_LISTING_ACTIONS:
+        _update_blocked_category_ids(req_type, content)
+        if filtered and config.blocked_category_names:
+            return _filter_categories(content)
+        return content
+    if filtered and action in _ITEM_LISTING_FIELDS:
+        return _filter_items(content, req_type, _ITEM_LISTING_FIELDS[action])
     return content
 
 
@@ -255,7 +311,11 @@ async def _prewarm_all() -> None:
     }
 
     for req_type, action in _LIVE_TV_PREWARM_ENDPOINTS:
-        await _fetch_and_cache(headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")])
+        content = await _fetch_and_cache(
+            headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")]
+        )
+        if content and action == "get_genres":
+            _update_blocked_category_ids(req_type, content)
         logger.info("Pre-warmed live TV: type=%s action=%s", req_type, action)
         await asyncio.sleep(config.prewarm_delay_seconds)
 
@@ -268,6 +328,7 @@ async def _prewarm_all() -> None:
 
         if not content:
             continue
+        _update_blocked_category_ids(req_type, content)
         category_ids = _parse_category_ids(content)
         for category_id in category_ids:
             for page in range(1, config.prewarm_vod_series_pages + 1):
@@ -305,6 +366,7 @@ async def startup() -> None:
 
 async def _proxy(request: Request, effective_path: str, filtered: bool) -> Response:
     upstream_path = _upstream_path(effective_path)
+    req_type = request.query_params.get("type", "")
     action = request.query_params.get("action", "")
     cacheable = request.method == "GET" and action in _CACHEABLE_ACTIONS
     cache_key = _cache_key(upstream_path, request.query_params.multi_items()) if cacheable else None
@@ -312,7 +374,7 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
     if cache_key is not None:
         cached = _listing_cache.get(cache_key)
         if cached is not None and cached.expires_at > time.time():
-            content = _apply_filter_if_needed(cached.content, action, filtered)
+            content = _apply_filter_if_needed(cached.content, req_type, action, filtered)
             return Response(content=content, status_code=cached.status_code, media_type=cached.content_type)
 
     session = await _get_valid_session()
@@ -354,7 +416,7 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
             expires_at=time.time() + config.listing_cache_ttl_seconds,
         )
 
-    content = _apply_filter_if_needed(response.content, action, filtered)
+    content = _apply_filter_if_needed(response.content, req_type, action, filtered)
 
     response_headers = {
         k: v for k, v in response.headers.items() if k.lower() not in _EXCLUDED_RESPONSE_HEADERS
