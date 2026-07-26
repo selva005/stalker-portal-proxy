@@ -29,7 +29,7 @@ class Config:
             for name in os.environ.get("BLOCKED_CATEGORY_NAMES", "").split(",")
             if name.strip()
         ]
-        self.listing_cache_ttl_seconds = float(os.environ.get("LISTING_CACHE_TTL_SECONDS", "600"))
+        self.listing_cache_ttl_seconds = float(os.environ.get("LISTING_CACHE_TTL_SECONDS", "21600"))
 
 
 try:

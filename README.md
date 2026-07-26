@@ -26,8 +26,9 @@ Optional: `STALKER_DEVICE_ID`, `STALKER_DEVICE_ID2` (some portals don't require 
 `STALKER_STB_TYPE` (default `MAG250`), `STALKER_API_SIGNATURE` (default `263`),
 `LOG_LEVEL` (default `INFO`), `BLOCKED_CATEGORY_NAMES` (comma-separated, case-insensitive
 substrings to hide from live TV genre / VOD category / series category listings, e.g.
-`ADULT,XXX`), `LISTING_CACHE_TTL_SECONDS` (default `600`, how long to cache genre/category/
-channel/VOD/series listing responses).
+`ADULT,XXX`), `LISTING_CACHE_TTL_SECONDS` (default `21600` / 6 hours, how long to cache
+genre/category/channel/VOD/series listing responses, and how often genre/category
+listings are refreshed in the background).
 
 ## Run with Docker Compose
 
@@ -68,5 +69,12 @@ uvicorn main:app --host 0.0.0.0 --port 8000
   app refreshes. Stream links (`create_link`) and EPG are never cached. The filtered and
   `/unfiltered/` endpoints share the same underlying cache entry — filtering is applied
   fresh on each response, not baked into the cached data.
+- Live TV genres and VOD/series categories are proactively pre-warmed on startup and
+  refreshed in the background every `LISTING_CACHE_TTL_SECONDS`, so those load instantly
+  rather than waiting for a TV app to trigger the first fetch. Full per-category item
+  listings (e.g. every page of every VOD category) are intentionally **not** pre-warmed —
+  large catalogs (tens of thousands of items per category) make a blind full crawl slow
+  and risk re-triggering the portal's rate limiting. Those stay reactively cached as your
+  TV app actually requests them.
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
 - Intended for LAN use across your own devices on your own account.

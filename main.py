@@ -5,6 +5,7 @@ downstream STB app (regardless of its own MAC/device settings) shares the same
 upstream identity. Everything else is forwarded to the real portal verbatim, with
 the real account's credentials injected.
 """
+import asyncio
 import json
 import logging
 import time
@@ -58,8 +59,8 @@ class _CacheEntry:
 _listing_cache: dict[str, _CacheEntry] = {}
 
 
-def _cache_key(upstream_path: str, query_params) -> str:
-    return f"{upstream_path}?{urlencode(sorted(query_params.multi_items()))}"
+def _cache_key(upstream_path: str, items) -> str:
+    return f"{upstream_path}?{urlencode(sorted(items))}"
 
 
 def _is_blocked_category(title: str) -> bool:
@@ -146,11 +147,70 @@ def _apply_filter_if_needed(content: bytes, action: str, filtered: bool) -> byte
     return content
 
 
+# Category/genre listings are cheap (one call each) and shared by every sync, so they're
+# worth pre-warming proactively rather than waiting for the first client request. Full
+# per-category item listings are NOT pre-warmed here: this account's catalog is large
+# enough (one VOD category alone had 36,000+ items at ~14/page) that blindly crawling
+# every page of every category would take a very long time and risk re-triggering the
+# portal's rate limiting. Those stay reactively cached (populated as the app requests them).
+_PREWARM_ENDPOINTS = [
+    ("itv", "get_genres"),
+    ("vod", "get_categories"),
+    ("series", "get_categories"),
+]
+
+
+async def _prewarm_categories() -> None:
+    try:
+        session = await _get_valid_session()
+    except PortalError as e:
+        logger.warning("Skipping category pre-warm: %s", e)
+        return
+
+    headers = {
+        "Cookie": f"mac={config.mac_address}; stb_lang=en; timezone=GMT",
+        "Authorization": f"Bearer {session.token}",
+    }
+    for req_type, action in _PREWARM_ENDPOINTS:
+        params = [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")]
+        url = f"{UPSTREAM_BASE}/stalker_portal/server/load.php"
+        try:
+            response = await client.http.get(url, params=params, headers=headers)
+        except httpx.HTTPError as e:
+            logger.warning("Pre-warm failed for type=%s action=%s: %s", req_type, action, e)
+            continue
+        if response.status_code != 200:
+            logger.warning(
+                "Pre-warm got status %s for type=%s action=%s", response.status_code, req_type, action
+            )
+            continue
+        key = _cache_key("/stalker_portal/server/load.php", params)
+        _listing_cache[key] = _CacheEntry(
+            status_code=response.status_code,
+            content_type=response.headers.get("content-type"),
+            content=response.content,
+            expires_at=time.time() + config.listing_cache_ttl_seconds,
+        )
+        logger.info("Pre-warmed cache for type=%s action=%s", req_type, action)
+
+
+async def _prewarm_loop() -> None:
+    while True:
+        await asyncio.sleep(config.listing_cache_ttl_seconds)
+        await _prewarm_categories()
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    await _prewarm_categories()
+    asyncio.create_task(_prewarm_loop())
+
+
 async def _proxy(request: Request, effective_path: str, filtered: bool) -> Response:
     upstream_path = _upstream_path(effective_path)
     action = request.query_params.get("action", "")
     cacheable = request.method == "GET" and action in _CACHEABLE_ACTIONS
-    cache_key = _cache_key(upstream_path, request.query_params) if cacheable else None
+    cache_key = _cache_key(upstream_path, request.query_params.multi_items()) if cacheable else None
 
     if cache_key is not None:
         cached = _listing_cache.get(cache_key)
