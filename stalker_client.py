@@ -30,12 +30,16 @@ def _md5(value: str) -> str:
     return hashlib.md5(value.encode("utf-8")).hexdigest()
 
 
+AUTH_FAILURE_COOLDOWN_SECONDS = 10.0
+
+
 class StalkerClient:
     def __init__(self, config: Config):
         self.config = config
         self.hw_version = "1.7-BD-" + _md5(config.mac_address)[:2].upper()
         self.hw_version_2 = _md5(config.serial_number.lower() + config.mac_address.lower())
         self._session: Optional[Session] = None
+        self._auth_failed_until: float = 0.0
         self.http = httpx.AsyncClient(timeout=15.0)
 
     def _headers(self, token: str = "") -> dict:
@@ -121,15 +125,23 @@ class StalkerClient:
 
     async def _authenticate(self) -> Session:
         logger.info("Authenticating with portal %s", self.config.host)
-        token = await self._get_token()
-        profile = await self._auth(token)
-        new_token = await self._handshake(token)
-        account_info = await self._get_account_info(new_token)
+        try:
+            token = await self._get_token()
+            profile = await self._auth(token)
+            new_token = await self._handshake(token)
+            account_info = await self._get_account_info(new_token)
+        except PortalError:
+            self._auth_failed_until = time.time() + AUTH_FAILURE_COOLDOWN_SECONDS
+            raise
         logger.info("Authentication successful")
         return Session(token=new_token, profile=profile, account_info=account_info)
 
     async def get_session(self, force_refresh: bool = False) -> Session:
         if force_refresh or self._session is None:
+            if time.time() < self._auth_failed_until:
+                raise PortalError(
+                    "Skipping re-authentication: recent auth failure, still in cooldown"
+                )
             self._session = await self._authenticate()
         return self._session
 

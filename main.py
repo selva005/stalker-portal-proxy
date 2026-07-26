@@ -80,25 +80,29 @@ async def catch_all(request: Request, path: str):
     req_type = params.get("type", "")
     action = params.get("action", "")
 
-    if req_type == "stb" and action == "handshake":
-        session = await _get_valid_session()
-        return JSONResponse({"js": {"token": session.token, "random": ""}})
+    try:
+        if req_type == "stb" and action == "handshake":
+            session = await _get_valid_session()
+            return JSONResponse({"js": {"token": session.token, "random": ""}})
 
-    if req_type == "stb" and action == "get_profile":
-        session = await _get_valid_session()
-        return JSONResponse({"js": session.profile})
+        if req_type == "stb" and action == "get_profile":
+            session = await _get_valid_session()
+            return JSONResponse({"js": session.profile})
 
-    if req_type == "account_info" and action == "get_main_info":
-        session = await _get_valid_session()
-        return JSONResponse({"js": session.account_info})
+        if req_type == "account_info" and action == "get_main_info":
+            session = await _get_valid_session()
+            return JSONResponse({"js": session.account_info})
 
-    filtered = True
-    effective_path = request.url.path
-    if effective_path == UNFILTERED_PREFIX or effective_path.startswith(UNFILTERED_PREFIX + "/"):
-        filtered = False
-        effective_path = effective_path[len(UNFILTERED_PREFIX):] or "/"
+        filtered = True
+        effective_path = request.url.path
+        if effective_path == UNFILTERED_PREFIX or effective_path.startswith(UNFILTERED_PREFIX + "/"):
+            filtered = False
+            effective_path = effective_path[len(UNFILTERED_PREFIX):] or "/"
 
-    return await _proxy(request, effective_path, filtered)
+        return await _proxy(request, effective_path, filtered)
+    except PortalError as e:
+        logger.warning("Portal unavailable: %s", e)
+        return Response(content=f"Portal unavailable: {e}", status_code=502)
 
 
 def _upstream_path(request_path: str) -> str:
