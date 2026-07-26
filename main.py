@@ -7,6 +7,9 @@ the real account's credentials injected.
 """
 import json
 import logging
+import time
+from dataclasses import dataclass
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, Request
@@ -36,6 +39,27 @@ _EXCLUDED_REQUEST_HEADERS = {
 # Actions that return a category/genre listing (live TV genres, VOD categories, series
 # categories all share this response shape: {"js": [{"id", "title", ...}, ...]}).
 _CATEGORY_LISTING_ACTIONS = {"get_genres", "get_categories"}
+
+# Read-heavy, slow-changing listing actions worth caching to cut down on repeated
+# portal hits from multiple TVs (or repeated app refreshes) requesting the same data.
+# Stream links (create_link) and EPG are intentionally excluded, since they're either
+# time-sensitive or already lightweight per-item lookups.
+_CACHEABLE_ACTIONS = {"get_genres", "get_categories", "get_all_channels", "get_ordered_list"}
+
+
+@dataclass
+class _CacheEntry:
+    status_code: int
+    content_type: str
+    content: bytes
+    expires_at: float
+
+
+_listing_cache: dict[str, _CacheEntry] = {}
+
+
+def _cache_key(upstream_path: str, query_params) -> str:
+    return f"{upstream_path}?{urlencode(sorted(query_params.multi_items()))}"
 
 
 def _is_blocked_category(title: str) -> bool:
@@ -116,9 +140,26 @@ def _upstream_path(request_path: str) -> str:
     return f"/stalker_portal{request_path}"
 
 
+def _apply_filter_if_needed(content: bytes, action: str, filtered: bool) -> bytes:
+    if filtered and config.blocked_category_names and action in _CATEGORY_LISTING_ACTIONS:
+        return _filter_categories(content)
+    return content
+
+
 async def _proxy(request: Request, effective_path: str, filtered: bool) -> Response:
+    upstream_path = _upstream_path(effective_path)
+    action = request.query_params.get("action", "")
+    cacheable = request.method == "GET" and action in _CACHEABLE_ACTIONS
+    cache_key = _cache_key(upstream_path, request.query_params) if cacheable else None
+
+    if cache_key is not None:
+        cached = _listing_cache.get(cache_key)
+        if cached is not None and cached.expires_at > time.time():
+            content = _apply_filter_if_needed(cached.content, action, filtered)
+            return Response(content=content, status_code=cached.status_code, media_type=cached.content_type)
+
     session = await _get_valid_session()
-    url = f"{UPSTREAM_BASE}{_upstream_path(effective_path)}"
+    url = f"{UPSTREAM_BASE}{upstream_path}"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _EXCLUDED_REQUEST_HEADERS}
     headers["Cookie"] = f"mac={config.mac_address}; stb_lang=en; timezone=GMT"
     headers["Authorization"] = f"Bearer {session.token}"
@@ -148,15 +189,15 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
     if response.status_code >= 500:
         client.invalidate_session()
 
-    content = response.content
-    action = request.query_params.get("action", "")
-    if (
-        filtered
-        and config.blocked_category_names
-        and action in _CATEGORY_LISTING_ACTIONS
-        and response.status_code == 200
-    ):
-        content = _filter_categories(content)
+    if cache_key is not None and response.status_code == 200:
+        _listing_cache[cache_key] = _CacheEntry(
+            status_code=response.status_code,
+            content_type=response.headers.get("content-type"),
+            content=response.content,
+            expires_at=time.time() + config.listing_cache_ttl_seconds,
+        )
+
+    content = _apply_filter_if_needed(response.content, action, filtered)
 
     response_headers = {
         k: v for k, v in response.headers.items() if k.lower() not in _EXCLUDED_RESPONSE_HEADERS

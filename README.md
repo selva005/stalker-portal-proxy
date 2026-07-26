@@ -26,7 +26,8 @@ Optional: `STALKER_DEVICE_ID`, `STALKER_DEVICE_ID2` (some portals don't require 
 `STALKER_STB_TYPE` (default `MAG250`), `STALKER_API_SIGNATURE` (default `263`),
 `LOG_LEVEL` (default `INFO`), `BLOCKED_CATEGORY_NAMES` (comma-separated, case-insensitive
 substrings to hide from live TV genre / VOD category / series category listings, e.g.
-`ADULT,XXX`).
+`ADULT,XXX`), `LISTING_CACHE_TTL_SECONDS` (default `600`, how long to cache genre/category/
+channel/VOD/series listing responses).
 
 ## Run with Docker Compose
 
@@ -62,5 +63,10 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 - The portal session (token/profile/account info) is cached in memory and only
   re-authenticated when a portal call fails, avoiding repeated handshakes upstream.
+- Genre, category, channel, VOD, and series listing responses are cached in memory for
+  `LISTING_CACHE_TTL_SECONDS` to cut down on repeated portal hits from multiple TVs or
+  app refreshes. Stream links (`create_link`) and EPG are never cached. The filtered and
+  `/unfiltered/` endpoints share the same underlying cache entry — filtering is applied
+  fresh on each response, not baked into the cached data.
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
 - Intended for LAN use across your own devices on your own account.
