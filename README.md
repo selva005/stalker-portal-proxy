@@ -88,3 +88,15 @@ uvicorn main:app --host 0.0.0.0 --port 8000
   `docker compose down`/`up` (not just a process restart).
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
 - Intended for LAN use across your own devices on your own account.
+
+## Intended use
+
+This is meant for personal use: sharing one Stalker-Portal account/subscription you
+already own across your own devices on your own network, without each device needing
+its own MAC whitelisting. It is not intended for redistributing portal access to other
+people, and doing so may violate your provider's terms of service. You're responsible
+for complying with the terms of whatever Stalker-Portal account you point this at.
+
+## License
+
+[MIT](LICENSE)
