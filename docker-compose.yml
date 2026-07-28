@@ -1,5 +1,7 @@
+name: stalker-portal-proxy
+
 services:
-  stalker2m3u:
+  stalker-portal-proxy:
     build: .
     ports:
       - "8000:8000"
