@@ -32,7 +32,9 @@ listing responses and how often the background auto-sync re-runs), `PREWARM_DELA
 (default `3`, how many pages of each VOD/series category to auto-sync), `CACHE_FILE_PATH`
 (default `/data/cache.json`, where the cache is persisted across restarts), `EPG_FILE_PATH`
 (default `/data/epg.xml`, where the generated XMLTV guide is persisted), `EPG_HOURS`
-(default `24`, how many hours of upcoming programming to include per channel).
+(default `24`, how many hours of upcoming programming to include per channel),
+`EPG_PUBLISH_EVERY_N_CHANNELS` (default `200`, publish partial EPG results every N
+channels during the crawl instead of waiting for the whole thing to finish).
 
 ## Run with Docker Compose
 
@@ -76,7 +78,10 @@ portal's working per-channel EPG action, `get_short_epg`):
 
 Both are built in the background (part of the same auto-sync cycle as live TV/VOD/series)
 covering the filtered channel set and `EPG_HOURS` of upcoming programming per channel, and
-persisted to disk so a restart doesn't serve empty data until the next crawl finishes.
+persisted to disk so a restart doesn't serve empty data until the next crawl finishes. On
+large channel lists a full crawl can take 30-60+ minutes; results are published
+incrementally every `EPG_PUBLISH_EVERY_N_CHANNELS` channels rather than waiting for the
+whole crawl, so channels already fetched show real guide data well before the crawl ends.
 
 ## Run locally without Docker
 

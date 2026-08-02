@@ -448,6 +448,7 @@ async def _build_epg() -> None:
         return
 
     programs_by_channel: dict[str, list[dict]] = {}
+    fetched_count = 0
     for channel in channels:
         xmltv_id = channel.get("xmltv_id")
         channel_id = channel.get("id")
@@ -467,6 +468,17 @@ async def _build_epg() -> None:
                 programs_by_channel[str(channel_id)] = response.json().get("js", [])
         except (httpx.HTTPError, ValueError) as e:
             logger.warning("EPG fetch failed for channel %s: %s", channel_id, e)
+
+        fetched_count += 1
+        if fetched_count % config.epg_publish_every_n_channels == 0:
+            _epg_programs_by_channel = dict(programs_by_channel)
+            _epg_document = build_xmltv(channels, programs_by_channel)
+            _save_epg_to_disk()
+            logger.info(
+                "EPG progress: published data for %d/%d channels so far",
+                fetched_count, len(channels),
+            )
+
         await asyncio.sleep(config.prewarm_delay_seconds)
 
     _epg_document = build_xmltv(channels, programs_by_channel)

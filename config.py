@@ -35,6 +35,7 @@ class Config:
         self.cache_file_path = os.environ.get("CACHE_FILE_PATH", "/data/cache.json")
         self.epg_file_path = os.environ.get("EPG_FILE_PATH", "/data/epg.xml")
         self.epg_hours = int(os.environ.get("EPG_HOURS", "24"))
+        self.epg_publish_every_n_channels = int(os.environ.get("EPG_PUBLISH_EVERY_N_CHANNELS", "200"))
 
 
 try:
