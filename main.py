@@ -450,10 +450,12 @@ async def _build_epg() -> None:
     programs_by_channel: dict[str, list[dict]] = {}
     fetched_count = 0
     for channel in channels:
-        xmltv_id = channel.get("xmltv_id")
         channel_id = channel.get("id")
-        if not xmltv_id or not channel_id:
+        if not channel_id:
             continue
+        # Note: xmltv_id is NOT required here -- get_epg_info answers are keyed by the
+        # channel's numeric id, not xmltv_id. Only the /epg.xml XMLTV document needs
+        # xmltv_id, and build_xmltv() already skips channels without one on its own.
         url = f"{UPSTREAM_BASE}/stalker_portal/server/load.php"
         params = [
             ("type", "itv"),
