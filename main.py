@@ -221,6 +221,15 @@ async def catch_all(request: Request, path: str):
             session = await _get_valid_session()
             return JSONResponse({"js": session.account_info})
 
+        if req_type == "itv" and action == "get_epg_info":
+            # This account's real portal returns nothing at all for this bulk EPG action
+            # (confirmed by direct testing), so answer it ourselves from the same
+            # per-channel program data already crawled for /epg.xml.
+            ch_id = params.get("ch_id")
+            if ch_id:
+                return JSONResponse({"js": {ch_id: _epg_programs_by_channel.get(ch_id, [])}})
+            return JSONResponse({"js": _epg_programs_by_channel})
+
         filtered = True
         effective_path = request.url.path
         if effective_path == UNFILTERED_PREFIX or effective_path.startswith(UNFILTERED_PREFIX + "/"):
@@ -357,6 +366,17 @@ async def _prewarm_all() -> None:
 
 _epg_document: bytes = EMPTY_XMLTV
 
+# Per-channel program lists from the last EPG crawl (channel id -> get_short_epg entries),
+# kept around so live get_epg_info requests can be answered directly instead of relying on
+# the real portal's bulk EPG action, which returns nothing for this account.
+_epg_programs_by_channel: dict[str, list[dict]] = {}
+
+_EPG_PROGRAMS_FILE_SUFFIX = ".programs.json"
+
+
+def _epg_programs_file_path() -> str:
+    return config.epg_file_path + _EPG_PROGRAMS_FILE_SUFFIX
+
 
 def _save_epg_to_disk() -> None:
     try:
@@ -367,18 +387,30 @@ def _save_epg_to_disk() -> None:
         with open(tmp_path, "wb") as f:
             f.write(_epg_document)
         os.replace(tmp_path, config.epg_file_path)
-        logger.info("Persisted EPG document to %s", config.epg_file_path)
+
+        programs_tmp_path = _epg_programs_file_path() + ".tmp"
+        with open(programs_tmp_path, "w") as f:
+            json.dump(_epg_programs_by_channel, f)
+        os.replace(programs_tmp_path, _epg_programs_file_path())
+
+        logger.info("Persisted EPG document and program data to %s", config.epg_file_path)
     except OSError as e:
         logger.warning("Failed to persist EPG to disk: %s", e)
 
 
 def _load_epg_from_disk() -> None:
-    global _epg_document
+    global _epg_document, _epg_programs_by_channel
     try:
         with open(config.epg_file_path, "rb") as f:
             _epg_document = f.read()
         logger.info("Loaded EPG document from %s", config.epg_file_path)
     except OSError:
+        pass
+    try:
+        with open(_epg_programs_file_path()) as f:
+            _epg_programs_by_channel = json.load(f)
+        logger.info("Loaded EPG program data for %d channels from disk", len(_epg_programs_by_channel))
+    except (OSError, ValueError):
         pass
 
 
@@ -388,7 +420,7 @@ async def _build_epg() -> None:
     Runs after the VOD/category pre-warm so the two background crawls don't compete for
     the same pacing budget at the same moment.
     """
-    global _epg_document
+    global _epg_document, _epg_programs_by_channel
 
     try:
         session = await _get_valid_session()
@@ -438,6 +470,7 @@ async def _build_epg() -> None:
         await asyncio.sleep(config.prewarm_delay_seconds)
 
     _epg_document = build_xmltv(channels, programs_by_channel)
+    _epg_programs_by_channel = programs_by_channel
     _save_epg_to_disk()
     logger.info("Built EPG document for %d channels", len(channels))
 

@@ -59,17 +59,24 @@ proxy using the real account's credentials.
   filters anything. Point a specific TV/profile here if you want the full, unfiltered
   catalog on that device.
 
-### XMLTV guide (`/epg.xml`)
+### EPG
 
-Some STB apps (e.g. TiviMate) fetch the whole program guide in one bulk portal call that
-some Stalker-Portal accounts simply don't support (a confirmed limitation on the real
-portal's side, not this proxy). `http://<homeserver-lan-ip>:8000/epg.xml` works around this
-by generating a standard XMLTV document from the portal's working per-channel EPG action
-instead — point your app's "EPG URL" / XMLTV source setting at it. It's built in the
-background (part of the same auto-sync cycle as live TV/VOD/series) covering the filtered
-channel set and `EPG_HOURS` of upcoming programming per channel; `/epg.xml` always serves
-whatever's currently built (possibly empty right after a fresh install, until the first
-background build finishes).
+Some STB apps (e.g. TiviMate) fetch the whole program guide via a bulk portal call
+(`get_epg_info`, no channel filter) that some Stalker-Portal accounts simply don't support
+(a confirmed limitation on the real portal's side, not this proxy — it returns nothing at
+all). This proxy works around it two ways, using the same underlying data (crawled via the
+portal's working per-channel EPG action, `get_short_epg`):
+
+- **Native**: `get_epg_info` requests (both the bulk form and the per-channel form) are
+  answered directly by the proxy instead of being forwarded to the real portal — apps using
+  the native Stalker Portal EPG integration (like TiviMate) should just get real guide data
+  automatically, no extra configuration needed.
+- **XMLTV fallback**: `http://<homeserver-lan-ip>:8000/epg.xml` serves the same data as a
+  standard XMLTV document, for apps that expect a separate XMLTV guide URL instead.
+
+Both are built in the background (part of the same auto-sync cycle as live TV/VOD/series)
+covering the filtered channel set and `EPG_HOURS` of upcoming programming per channel, and
+persisted to disk so a restart doesn't serve empty data until the next crawl finishes.
 
 ## Run locally without Docker
 
