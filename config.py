@@ -33,6 +33,8 @@ class Config:
         self.prewarm_delay_seconds = float(os.environ.get("PREWARM_DELAY_SECONDS", "0.3"))
         self.prewarm_vod_series_pages = int(os.environ.get("PREWARM_VOD_SERIES_PAGES", "3"))
         self.cache_file_path = os.environ.get("CACHE_FILE_PATH", "/data/cache.json")
+        self.epg_file_path = os.environ.get("EPG_FILE_PATH", "/data/epg.xml")
+        self.epg_hours = int(os.environ.get("EPG_HOURS", "24"))
 
 
 try:

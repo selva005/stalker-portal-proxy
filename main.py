@@ -19,6 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from config import config
+from epg import EMPTY_XMLTV, build_xmltv
 from stalker_client import PortalError, StalkerClient
 
 logging.basicConfig(
@@ -200,6 +201,9 @@ async def catch_all(request: Request, path: str):
     already includes the `/stalker_portal` prefix, so routing here is done by
     query params (`type`/`action`), not by matching a literal path.
     """
+    if request.url.path in ("/epg.xml", "/epg.xml/"):
+        return Response(content=_epg_document, media_type="application/xml")
+
     params = request.query_params
     req_type = params.get("type", "")
     action = params.get("action", "")
@@ -351,17 +355,110 @@ async def _prewarm_all() -> None:
     _save_cache_to_disk()
 
 
-async def _prewarm_loop() -> None:
-    while True:
-        await asyncio.sleep(config.listing_cache_ttl_seconds)
-        await _prewarm_all()
+_epg_document: bytes = EMPTY_XMLTV
+
+
+def _save_epg_to_disk() -> None:
+    try:
+        epg_dir = os.path.dirname(config.epg_file_path)
+        if epg_dir:
+            os.makedirs(epg_dir, exist_ok=True)
+        tmp_path = config.epg_file_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(_epg_document)
+        os.replace(tmp_path, config.epg_file_path)
+        logger.info("Persisted EPG document to %s", config.epg_file_path)
+    except OSError as e:
+        logger.warning("Failed to persist EPG to disk: %s", e)
+
+
+def _load_epg_from_disk() -> None:
+    global _epg_document
+    try:
+        with open(config.epg_file_path, "rb") as f:
+            _epg_document = f.read()
+        logger.info("Loaded EPG document from %s", config.epg_file_path)
+    except OSError:
+        pass
+
+
+async def _build_epg() -> None:
+    """Crawl get_short_epg for every filtered channel and rebuild the XMLTV document.
+
+    Runs after the VOD/category pre-warm so the two background crawls don't compete for
+    the same pacing budget at the same moment.
+    """
+    global _epg_document
+
+    try:
+        session = await _get_valid_session()
+    except PortalError as e:
+        logger.warning("Skipping EPG build: %s", e)
+        return
+
+    headers = {
+        "Cookie": f"mac={config.mac_address}; stb_lang=en; timezone=GMT",
+        "Authorization": f"Bearer {session.token}",
+    }
+
+    content = await _fetch_and_cache(
+        headers, [("type", "itv"), ("action", "get_all_channels"), ("JsHttpRequest", "1-xml")]
+    )
+    if not content:
+        logger.warning("Skipping EPG build: could not fetch channel list")
+        return
+
+    filtered_content = _filter_items(content, "itv", "tv_genre_id")
+    try:
+        channels = json.loads(filtered_content).get("js", {}).get("data", [])
+    except ValueError:
+        logger.warning("Skipping EPG build: channel list was not valid JSON")
+        return
+
+    programs_by_channel: dict[str, list[dict]] = {}
+    for channel in channels:
+        xmltv_id = channel.get("xmltv_id")
+        channel_id = channel.get("id")
+        if not xmltv_id or not channel_id:
+            continue
+        url = f"{UPSTREAM_BASE}/stalker_portal/server/load.php"
+        params = [
+            ("type", "itv"),
+            ("action", "get_short_epg"),
+            ("ch_id", str(channel_id)),
+            ("size", str(config.epg_hours)),
+            ("JsHttpRequest", "1-xml"),
+        ]
+        try:
+            response = await client.http.get(url, params=params, headers=headers)
+            if response.status_code == 200:
+                programs_by_channel[str(channel_id)] = response.json().get("js", [])
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning("EPG fetch failed for channel %s: %s", channel_id, e)
+        await asyncio.sleep(config.prewarm_delay_seconds)
+
+    _epg_document = build_xmltv(channels, programs_by_channel)
+    _save_epg_to_disk()
+    logger.info("Built EPG document for %d channels", len(channels))
 
 
 @app.on_event("startup")
 async def startup() -> None:
     _load_cache_from_disk()
-    asyncio.create_task(_prewarm_all())
-    asyncio.create_task(_prewarm_loop())
+    _load_epg_from_disk()
+
+    async def _run_background_sync():
+        await _prewarm_all()
+        await _build_epg()
+
+    asyncio.create_task(_run_background_sync())
+
+    async def _background_sync_loop():
+        while True:
+            await asyncio.sleep(config.listing_cache_ttl_seconds)
+            await _run_background_sync()
+
+    asyncio.create_task(_background_sync_loop())
 
 
 async def _proxy(request: Request, effective_path: str, filtered: bool) -> Response:

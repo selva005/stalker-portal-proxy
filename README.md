@@ -30,7 +30,9 @@ substrings to hide from live TV genre / VOD category / series category listings,
 listing responses and how often the background auto-sync re-runs), `PREWARM_DELAY_SECONDS`
 (default `0.3`, delay between requests during auto-sync), `PREWARM_VOD_SERIES_PAGES`
 (default `3`, how many pages of each VOD/series category to auto-sync), `CACHE_FILE_PATH`
-(default `/data/cache.json`, where the cache is persisted across restarts).
+(default `/data/cache.json`, where the cache is persisted across restarts), `EPG_FILE_PATH`
+(default `/data/epg.xml`, where the generated XMLTV guide is persisted), `EPG_HOURS`
+(default `24`, how many hours of upcoming programming to include per channel).
 
 ## Run with Docker Compose
 
@@ -56,6 +58,18 @@ proxy using the real account's credentials.
 - `http://<homeserver-lan-ip>:8000/unfiltered/` — same account, same session, but never
   filters anything. Point a specific TV/profile here if you want the full, unfiltered
   catalog on that device.
+
+### XMLTV guide (`/epg.xml`)
+
+Some STB apps (e.g. TiviMate) fetch the whole program guide in one bulk portal call that
+some Stalker-Portal accounts simply don't support (a confirmed limitation on the real
+portal's side, not this proxy). `http://<homeserver-lan-ip>:8000/epg.xml` works around this
+by generating a standard XMLTV document from the portal's working per-channel EPG action
+instead — point your app's "EPG URL" / XMLTV source setting at it. It's built in the
+background (part of the same auto-sync cycle as live TV/VOD/series) covering the filtered
+channel set and `EPG_HOURS` of upcoming programming per channel; `/epg.xml` always serves
+whatever's currently built (possibly empty right after a fresh install, until the first
+background build finishes).
 
 ## Run locally without Docker
 
@@ -86,6 +100,9 @@ uvicorn main:app --host 0.0.0.0 --port 8000
   on shutdown, and reloaded on startup — a container restart doesn't start cold. Backed by
   the `cache_data` Docker volume in `docker-compose.yml`, so it survives
   `docker compose down`/`up` (not just a process restart).
+- **EPG generation** runs after the VOD/category auto-sync (so the two background crawls
+  don't compete for the same pacing budget at once), persisted to `EPG_FILE_PATH` the same
+  way as the listing cache.
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
 - Intended for LAN use across your own devices on your own account.
 
