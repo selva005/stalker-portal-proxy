@@ -361,7 +361,7 @@ async def _prewarm_all() -> None:
             config.prewarm_vod_series_pages, len(category_ids), req_type,
         )
 
-    _save_cache_to_disk()
+    await asyncio.to_thread(_save_cache_to_disk)
 
 
 _epg_document: bytes = EMPTY_XMLTV
@@ -474,8 +474,8 @@ async def _build_epg() -> None:
         fetched_count += 1
         if fetched_count % config.epg_publish_every_n_channels == 0:
             _epg_programs_by_channel = dict(programs_by_channel)
-            _epg_document = build_xmltv(channels, programs_by_channel)
-            _save_epg_to_disk()
+            _epg_document = await asyncio.to_thread(build_xmltv, channels, programs_by_channel)
+            await asyncio.to_thread(_save_epg_to_disk)
             logger.info(
                 "EPG progress: published data for %d/%d channels so far",
                 fetched_count, len(channels),
@@ -483,9 +483,9 @@ async def _build_epg() -> None:
 
         await asyncio.sleep(config.prewarm_delay_seconds)
 
-    _epg_document = build_xmltv(channels, programs_by_channel)
+    _epg_document = await asyncio.to_thread(build_xmltv, channels, programs_by_channel)
     _epg_programs_by_channel = programs_by_channel
-    _save_epg_to_disk()
+    await asyncio.to_thread(_save_epg_to_disk)
     logger.info("Built EPG document for %d channels", len(channels))
 
 
@@ -575,5 +575,5 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
 
 @app.on_event("shutdown")
 async def shutdown():
-    _save_cache_to_disk()
+    await asyncio.to_thread(_save_cache_to_disk)
     await client.close()
