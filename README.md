@@ -13,6 +13,20 @@ repeated re-handshakes upstream invalidating each other's tokens. Every other re
 (channel/VOD/series listings, EPG, images, stream links) is forwarded to the real portal
 verbatim, with the real account's credentials injected.
 
+**Session freshness and recovery:** the cached session isn't trusted forever. Each time a
+TV app's handshake/get_profile/account_info request comes in, if the cached session is
+older than `SESSION_MAX_AGE_SECONDS` (default 30 minutes), it's proactively refreshed
+before answering — this is checked on-demand when an app actually connects, not on a
+background timer. This matters if you ever run a second instance of this proxy against the
+same account/MAC (e.g. a dev/test environment) — Stalker-Portal backends generally bind one
+active token per MAC, so a fresh handshake from one instance can silently invalidate the
+other's session; the freshness check catches this the next time an app connects rather than
+serving a dead session indefinitely. Separately, if a real proxied request (not one of the
+three short-circuited actions above) gets a `401`/`403` from the real portal, the proxy
+re-authenticates and **retries that same request once** before returning a response — so a
+silently-invalidated session self-heals within the same request rather than requiring the
+client to notice the failure and try again on its own.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in your portal details:
@@ -39,7 +53,9 @@ channels during the crawl instead of waiting for the whole thing to finish),
 during background auto-sync), `PREWARM_MAX_CONSECUTIVE_RATE_LIMITS` (default `5`, abort
 the current crawl cycle after this many consecutive 429s), `EPG_FRESHNESS_TTL_SECONDS`
 (default same as `LISTING_CACHE_TTL_SECONDS`, skip the startup EPG crawl if persisted
-data is still within this age).
+data is still within this age), `SESSION_MAX_AGE_SECONDS` (default `1800` / 30 minutes,
+how long a cached session is trusted before the next handshake/get_profile proactively
+re-authenticates instead of trusting the cache indefinitely).
 
 ## Run with Docker Compose
 

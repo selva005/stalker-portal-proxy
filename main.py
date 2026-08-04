@@ -185,12 +185,25 @@ def _filter_items(content: bytes, req_type: str, id_field: str) -> bytes:
     return json.dumps(data).encode()
 
 
-async def _get_valid_session(role: str = "realtime"):
+async def _get_valid_session(role: str = "realtime", max_age: float = None):
     try:
-        return await client.get_session(role=role)
+        session = await client.get_session(role=role)
     except PortalError:
         client.invalidate_session()
         return await client.get_session(force_refresh=True, role=role)
+
+    if max_age is not None and (time.time() - session.obtained_at) > max_age:
+        # The cached session is old enough that we no longer trust it's still accepted
+        # upstream without checking (e.g. it may have been silently invalidated by another
+        # device authenticating with the same MAC). Refresh proactively rather than only
+        # reacting after a real request gets a 401/403.
+        try:
+            return await client.get_session(force_refresh=True, role=role)
+        except PortalError as e:
+            logger.warning("Proactive session refresh failed (%s), using stale session", e)
+            return session
+
+    return session
 
 
 # Requests under this prefix skip category filtering entirely, e.g. an STB app
@@ -215,15 +228,19 @@ async def catch_all(request: Request, path: str):
 
     try:
         if req_type == "stb" and action == "handshake":
-            session = await _get_valid_session()
+            # This is the entry point of a TV app's session lifecycle -- check staleness
+            # here (and on get_profile/account_info below) rather than on a background
+            # timer, so a silently-invalidated session (e.g. another device authenticating
+            # with the same MAC) gets caught right when an app actually starts using it.
+            session = await _get_valid_session(max_age=config.session_max_age_seconds)
             return JSONResponse({"js": {"token": session.token, "random": ""}})
 
         if req_type == "stb" and action == "get_profile":
-            session = await _get_valid_session()
+            session = await _get_valid_session(max_age=config.session_max_age_seconds)
             return JSONResponse({"js": session.profile})
 
         if req_type == "account_info" and action == "get_main_info":
-            session = await _get_valid_session()
+            session = await _get_valid_session(max_age=config.session_max_age_seconds)
             return JSONResponse({"js": session.account_info})
 
         if req_type == "itv" and action == "get_epg_info":
@@ -655,7 +672,22 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
         except httpx.HTTPError as e2:
             return Response(content=f"Upstream unreachable: {e2}", status_code=502)
 
-    if response.status_code in (401, 403) or response.status_code >= 500:
+    if response.status_code in (401, 403):
+        # Retry this same request once with a fresh session, rather than only invalidating
+        # for next time -- self-heals within this request instead of forcing the client to
+        # see the failure and issue a second request on its own to recover.
+        logger.warning(
+            "Upstream returned %s, retrying once with a fresh session", response.status_code
+        )
+        client.invalidate_session()
+        session = await _get_valid_session()
+        headers["Authorization"] = f"Bearer {session.token}"
+        try:
+            response = await do_request()
+        except httpx.HTTPError as e:
+            return Response(content=f"Upstream unreachable: {e}", status_code=502)
+
+    if response.status_code >= 500:
         client.invalidate_session()
 
     if cache_key is not None and response.status_code == 200:

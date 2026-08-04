@@ -45,6 +45,7 @@ class Config:
         self.epg_freshness_ttl_seconds = float(
             os.environ.get("EPG_FRESHNESS_TTL_SECONDS", str(self.listing_cache_ttl_seconds))
         )
+        self.session_max_age_seconds = float(os.environ.get("SESSION_MAX_AGE_SECONDS", "1800"))
 
 
 try:
