@@ -30,6 +30,11 @@ logger = logging.getLogger("main")
 
 app = FastAPI(title="Stalker-Portal Proxy")
 client = StalkerClient(config)
+# Separate HTTP transport for the background crawl (VOD/category pre-warm + EPG), so a
+# hung/slow crawl request can never compete with real-time traffic for a connection out of
+# the same pool. Auth/session state is still fully shared via `client` -- see
+# `_get_valid_session`'s `role` param for why the crawl doesn't get its own login.
+crawl_http = httpx.AsyncClient(timeout=15.0)
 
 UPSTREAM_BASE = f"http://{config.host}"
 
@@ -180,12 +185,12 @@ def _filter_items(content: bytes, req_type: str, id_field: str) -> bytes:
     return json.dumps(data).encode()
 
 
-async def _get_valid_session():
+async def _get_valid_session(role: str = "realtime"):
     try:
-        return await client.get_session()
+        return await client.get_session(role=role)
     except PortalError:
         client.invalidate_session()
-        return await client.get_session(force_refresh=True)
+        return await client.get_session(force_refresh=True, role=role)
 
 
 # Requests under this prefix skip category filtering entirely, e.g. an STB app
@@ -291,13 +296,45 @@ def _parse_category_ids(content: bytes) -> list[str]:
     return [str(c["id"]) for c in categories if c.get("id") is not None]
 
 
-async def _fetch_and_cache(headers: dict, params: list[tuple[str, str]]) -> bytes | None:
+async def _handle_rate_limit(response: httpx.Response, consecutive: int) -> tuple[bool, int]:
+    """If `response` is a 429, back off before the caller's next request.
+
+    Returns (should_abort_this_crawl_cycle, updated_consecutive_429_count). Backing off here
+    (rather than silently skipping, as before) directly reduces pressure on the shared
+    upstream account during a long-running crawl -- sustained rate-limiting during a crawl
+    was the leading theory for why real-time STB auth requests started failing once the EPG
+    crawl was introduced (the crawl's own auth attempts share a cooldown with real traffic;
+    see `role` on `_get_valid_session`/`StalkerClient.get_session`).
+    """
+    if response.status_code != 429:
+        return False, 0
+    backoff = config.prewarm_rate_limit_backoff_seconds
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            backoff = max(backoff, float(retry_after))
+        except ValueError:
+            pass
+    consecutive += 1
+    logger.warning(
+        "Rate limited (429), backing off %.1fs (consecutive=%d/%d)",
+        backoff, consecutive, config.prewarm_max_consecutive_rate_limits,
+    )
+    await asyncio.sleep(backoff)
+    return consecutive >= config.prewarm_max_consecutive_rate_limits, consecutive
+
+
+async def _fetch_and_cache(
+    headers: dict, params: list[tuple[str, str]], http: httpx.AsyncClient = None
+) -> bytes | None:
+    http = http or client.http
     url = f"{UPSTREAM_BASE}/stalker_portal/server/load.php"
     try:
-        response = await client.http.get(url, params=params, headers=headers)
+        response = await http.get(url, params=params, headers=headers)
     except httpx.HTTPError as e:
         logger.warning("Pre-warm request failed for %s: %s", params, e)
         return None
+    await _handle_rate_limit(response, 0)
     if response.status_code != 200:
         logger.warning("Pre-warm got status %s for %s", response.status_code, params)
         return None
@@ -313,7 +350,7 @@ async def _fetch_and_cache(headers: dict, params: list[tuple[str, str]]) -> byte
 
 async def _prewarm_all() -> None:
     try:
-        session = await _get_valid_session()
+        session = await _get_valid_session(role="crawl")
     except PortalError as e:
         logger.warning("Skipping pre-warm: %s", e)
         return
@@ -325,7 +362,7 @@ async def _prewarm_all() -> None:
 
     for req_type, action in _LIVE_TV_PREWARM_ENDPOINTS:
         content = await _fetch_and_cache(
-            headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")]
+            headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")], http=crawl_http
         )
         if content and action == "get_genres":
             _update_blocked_category_ids(req_type, content)
@@ -334,7 +371,7 @@ async def _prewarm_all() -> None:
 
     for req_type, action in _CATALOG_PREWARM_ENDPOINTS:
         content = await _fetch_and_cache(
-            headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")]
+            headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")], http=crawl_http
         )
         logger.info("Pre-warmed categories: type=%s action=%s", req_type, action)
         await asyncio.sleep(config.prewarm_delay_seconds)
@@ -354,6 +391,7 @@ async def _prewarm_all() -> None:
                         ("p", str(page)),
                         ("JsHttpRequest", "1-xml"),
                     ],
+                    http=crawl_http,
                 )
                 await asyncio.sleep(config.prewarm_delay_seconds)
         logger.info(
@@ -414,16 +452,68 @@ def _load_epg_from_disk() -> None:
         pass
 
 
+_EPG_META_FILE_SUFFIX = ".meta.json"
+
+
+def _epg_meta_file_path() -> str:
+    return config.epg_file_path + _EPG_META_FILE_SUFFIX
+
+
+def _save_epg_meta_to_disk(completed_at: float, channel_count: int) -> None:
+    """Record when the last FULLY-COMPLETED crawl finished (not partial-publish points).
+
+    A partial publish (see `_publish_epg`) replaces `_epg_programs_by_channel` wholesale
+    rather than merging with a prior complete crawl's data for channels not yet reached in
+    the current pass. If a crawl is interrupted shortly after a partial publish, using that
+    write's timestamp for freshness would make an incomplete guide look "fresh" and skip a
+    real re-crawl -- so this is only written at true completion.
+    """
+    try:
+        meta_dir = os.path.dirname(_epg_meta_file_path())
+        if meta_dir:
+            os.makedirs(meta_dir, exist_ok=True)
+        tmp_path = _epg_meta_file_path() + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump({"completed_at": completed_at, "channel_count": channel_count}, f)
+        os.replace(tmp_path, _epg_meta_file_path())
+    except OSError as e:
+        logger.warning("Failed to persist EPG metadata to disk: %s", e)
+
+
+def _load_epg_meta_from_disk() -> dict | None:
+    try:
+        with open(_epg_meta_file_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _epg_is_fresh() -> bool:
+    if not _epg_programs_by_channel:
+        return False
+    meta = _load_epg_meta_from_disk()
+    if not meta or not isinstance(meta.get("completed_at"), (int, float)):
+        return False
+    age = time.time() - meta["completed_at"]
+    return age < config.epg_freshness_ttl_seconds
+
+
+async def _publish_epg(channels: list[dict], programs_by_channel: dict[str, list[dict]]) -> None:
+    """Rebuild the XMLTV doc from `programs_by_channel` and persist everything to disk."""
+    global _epg_document, _epg_programs_by_channel
+    _epg_programs_by_channel = dict(programs_by_channel)
+    _epg_document = await asyncio.to_thread(build_xmltv, channels, programs_by_channel)
+    await asyncio.to_thread(_save_epg_to_disk)
+
+
 async def _build_epg() -> None:
     """Crawl get_short_epg for every filtered channel and rebuild the XMLTV document.
 
     Runs after the VOD/category pre-warm so the two background crawls don't compete for
     the same pacing budget at the same moment.
     """
-    global _epg_document, _epg_programs_by_channel
-
     try:
-        session = await _get_valid_session()
+        session = await _get_valid_session(role="crawl")
     except PortalError as e:
         logger.warning("Skipping EPG build: %s", e)
         return
@@ -434,7 +524,7 @@ async def _build_epg() -> None:
     }
 
     content = await _fetch_and_cache(
-        headers, [("type", "itv"), ("action", "get_all_channels"), ("JsHttpRequest", "1-xml")]
+        headers, [("type", "itv"), ("action", "get_all_channels"), ("JsHttpRequest", "1-xml")], http=crawl_http
     )
     if not content:
         logger.warning("Skipping EPG build: could not fetch channel list")
@@ -449,6 +539,7 @@ async def _build_epg() -> None:
 
     programs_by_channel: dict[str, list[dict]] = {}
     fetched_count = 0
+    consecutive_rate_limits = 0
     for channel in channels:
         channel_id = channel.get("id")
         if not channel_id:
@@ -465,17 +556,30 @@ async def _build_epg() -> None:
             ("JsHttpRequest", "1-xml"),
         ]
         try:
-            response = await client.http.get(url, params=params, headers=headers)
+            response = await crawl_http.get(url, params=params, headers=headers)
+            should_abort, consecutive_rate_limits = await _handle_rate_limit(
+                response, consecutive_rate_limits
+            )
+            if should_abort:
+                logger.warning(
+                    "Aborting EPG crawl after %d consecutive rate-limit responses "
+                    "(%d/%d channels fetched)",
+                    consecutive_rate_limits, fetched_count, len(channels),
+                )
+                await _publish_epg(channels, programs_by_channel)
+                return
             if response.status_code == 200:
                 programs_by_channel[str(channel_id)] = response.json().get("js", [])
+            elif response.status_code != 429:
+                logger.warning(
+                    "EPG fetch got status %s for channel %s", response.status_code, channel_id
+                )
         except (httpx.HTTPError, ValueError) as e:
             logger.warning("EPG fetch failed for channel %s: %s", channel_id, e)
 
         fetched_count += 1
         if fetched_count % config.epg_publish_every_n_channels == 0:
-            _epg_programs_by_channel = dict(programs_by_channel)
-            _epg_document = await asyncio.to_thread(build_xmltv, channels, programs_by_channel)
-            await asyncio.to_thread(_save_epg_to_disk)
+            await _publish_epg(channels, programs_by_channel)
             logger.info(
                 "EPG progress: published data for %d/%d channels so far",
                 fetched_count, len(channels),
@@ -483,27 +587,29 @@ async def _build_epg() -> None:
 
         await asyncio.sleep(config.prewarm_delay_seconds)
 
-    _epg_document = await asyncio.to_thread(build_xmltv, channels, programs_by_channel)
-    _epg_programs_by_channel = programs_by_channel
-    await asyncio.to_thread(_save_epg_to_disk)
+    await _publish_epg(channels, programs_by_channel)
+    await asyncio.to_thread(_save_epg_meta_to_disk, time.time(), len(channels))
     logger.info("Built EPG document for %d channels", len(channels))
 
 
 @app.on_event("startup")
 async def startup() -> None:
     _load_cache_from_disk()
-    _load_epg_from_disk()
+    _load_epg_from_disk()  # must run before _epg_is_fresh() is checked below
 
-    async def _run_background_sync():
+    async def _run_background_sync(skip_epg_if_fresh: bool = False):
         await _prewarm_all()
+        if skip_epg_if_fresh and _epg_is_fresh():
+            logger.info("Skipping startup EPG crawl: loaded data is within the freshness threshold")
+            return
         await _build_epg()
 
-    asyncio.create_task(_run_background_sync())
+    asyncio.create_task(_run_background_sync(skip_epg_if_fresh=True))
 
     async def _background_sync_loop():
         while True:
             await asyncio.sleep(config.listing_cache_ttl_seconds)
-            await _run_background_sync()
+            await _run_background_sync()  # periodic loop always rebuilds, freshness-skip is startup-only
 
     asyncio.create_task(_background_sync_loop())
 
@@ -549,7 +655,7 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
         except httpx.HTTPError as e2:
             return Response(content=f"Upstream unreachable: {e2}", status_code=502)
 
-    if response.status_code >= 500:
+    if response.status_code in (401, 403) or response.status_code >= 500:
         client.invalidate_session()
 
     if cache_key is not None and response.status_code == 200:
@@ -577,3 +683,4 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
 async def shutdown():
     await asyncio.to_thread(_save_cache_to_disk)
     await client.close()
+    await crawl_http.aclose()

@@ -1,4 +1,5 @@
 """Async client for authenticating and querying a Stalker-Portal, ported from worker.js."""
+import asyncio
 import hashlib
 import json
 import logging
@@ -39,7 +40,8 @@ class StalkerClient:
         self.hw_version = "1.7-BD-" + _md5(config.mac_address)[:2].upper()
         self.hw_version_2 = _md5(config.serial_number.lower() + config.mac_address.lower())
         self._session: Optional[Session] = None
-        self._auth_failed_until: float = 0.0
+        self._auth_failed_until_by_role: dict[str, float] = {}
+        self._auth_lock = asyncio.Lock()
         self.http = httpx.AsyncClient(timeout=15.0)
 
     def _headers(self, token: str = "") -> dict:
@@ -125,24 +127,36 @@ class StalkerClient:
 
     async def _authenticate(self) -> Session:
         logger.info("Authenticating with portal %s", self.config.host)
-        try:
-            token = await self._get_token()
-            profile = await self._auth(token)
-            new_token = await self._handshake(token)
-            account_info = await self._get_account_info(new_token)
-        except PortalError:
-            self._auth_failed_until = time.time() + AUTH_FAILURE_COOLDOWN_SECONDS
-            raise
+        token = await self._get_token()
+        profile = await self._auth(token)
+        new_token = await self._handshake(token)
+        account_info = await self._get_account_info(new_token)
         logger.info("Authentication successful")
         return Session(token=new_token, profile=profile, account_info=account_info)
 
-    async def get_session(self, force_refresh: bool = False) -> Session:
+    async def get_session(self, force_refresh: bool = False, role: str = "default") -> Session:
+        """Return the shared session, authenticating if needed.
+
+        `role` scopes the auth-failure cooldown only -- there is still exactly one shared
+        session/token for the whole process (never two independent logins for the same
+        MAC, which risks each invalidating the other's token upstream). Scoping the
+        cooldown by role means a failure triggered by one role (e.g. a long-running
+        background crawl) doesn't block another role's (e.g. real-time STB traffic)
+        ability to attempt its own re-authentication.
+        """
         if force_refresh or self._session is None:
-            if time.time() < self._auth_failed_until:
-                raise PortalError(
-                    "Skipping re-authentication: recent auth failure, still in cooldown"
-                )
-            self._session = await self._authenticate()
+            async with self._auth_lock:
+                if force_refresh or self._session is None:  # re-check: another caller may have won the race
+                    failed_until = self._auth_failed_until_by_role.get(role, 0.0)
+                    if time.time() < failed_until:
+                        raise PortalError(
+                            f"Skipping re-authentication (role={role}): recent auth failure, still in cooldown"
+                        )
+                    try:
+                        self._session = await self._authenticate()
+                    except PortalError:
+                        self._auth_failed_until_by_role[role] = time.time() + AUTH_FAILURE_COOLDOWN_SECONDS
+                        raise
         return self._session
 
     def invalidate_session(self) -> None:

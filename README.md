@@ -34,7 +34,12 @@ listing responses and how often the background auto-sync re-runs), `PREWARM_DELA
 (default `/data/epg.xml`, where the generated XMLTV guide is persisted), `EPG_HOURS`
 (default `24`, how many hours of upcoming programming to include per channel),
 `EPG_PUBLISH_EVERY_N_CHANNELS` (default `200`, publish partial EPG results every N
-channels during the crawl instead of waiting for the whole thing to finish).
+channels during the crawl instead of waiting for the whole thing to finish),
+`PREWARM_RATE_LIMIT_BACKOFF_SECONDS` (default `30`, how long to back off after a 429
+during background auto-sync), `PREWARM_MAX_CONSECUTIVE_RATE_LIMITS` (default `5`, abort
+the current crawl cycle after this many consecutive 429s), `EPG_FRESHNESS_TTL_SECONDS`
+(default same as `LISTING_CACHE_TTL_SECONDS`, skip the startup EPG crawl if persisted
+data is still within this age).
 
 ## Run with Docker Compose
 
@@ -82,6 +87,17 @@ persisted to disk so a restart doesn't serve empty data until the next crawl fin
 large channel lists a full crawl can take 30-60+ minutes; results are published
 incrementally every `EPG_PUBLISH_EVERY_N_CHANNELS` channels rather than waiting for the
 whole crawl, so channels already fetched show real guide data well before the crawl ends.
+If persisted EPG data is still fresh (within `EPG_FRESHNESS_TTL_SECONDS`) when the process
+starts, the startup crawl is skipped entirely and the persisted data is served as-is until
+the next scheduled background refresh — a restart doesn't force a full re-crawl.
+
+The crawl also detects rate-limiting (429) responses from the portal, backs off
+(`PREWARM_RATE_LIMIT_BACKOFF_SECONDS`) instead of continuing at full pace, and aborts the
+current cycle (publishing whatever was gathered so far) after
+`PREWARM_MAX_CONSECUTIVE_RATE_LIMITS` consecutive 429s — sustained rate-limiting from a
+long-running crawl was found to also disrupt real-time STB app authentication (the crawl
+and real-time traffic share one portal session, with a per-role failure cooldown so a
+crawl-triggered auth failure doesn't block real devices' own re-authentication attempts).
 
 ## Run locally without Docker
 
@@ -114,7 +130,9 @@ uvicorn main:app --host 0.0.0.0 --port 8000
   `docker compose down`/`up` (not just a process restart).
 - **EPG generation** runs after the VOD/category auto-sync (so the two background crawls
   don't compete for the same pacing budget at once), persisted to `EPG_FILE_PATH` the same
-  way as the listing cache.
+  way as the listing cache. The background crawl uses its own HTTP connection pool,
+  separate from real-time proxied traffic, so a slow/hung crawl request can't compete with
+  real devices for a connection.
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
 - Intended for LAN use across your own devices on your own account.
 

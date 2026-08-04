@@ -32,10 +32,19 @@ class Config:
         self.listing_cache_ttl_seconds = float(os.environ.get("LISTING_CACHE_TTL_SECONDS", "21600"))
         self.prewarm_delay_seconds = float(os.environ.get("PREWARM_DELAY_SECONDS", "0.3"))
         self.prewarm_vod_series_pages = int(os.environ.get("PREWARM_VOD_SERIES_PAGES", "3"))
+        self.prewarm_rate_limit_backoff_seconds = float(
+            os.environ.get("PREWARM_RATE_LIMIT_BACKOFF_SECONDS", "30")
+        )
+        self.prewarm_max_consecutive_rate_limits = int(
+            os.environ.get("PREWARM_MAX_CONSECUTIVE_RATE_LIMITS", "5")
+        )
         self.cache_file_path = os.environ.get("CACHE_FILE_PATH", "/data/cache.json")
         self.epg_file_path = os.environ.get("EPG_FILE_PATH", "/data/epg.xml")
         self.epg_hours = int(os.environ.get("EPG_HOURS", "24"))
         self.epg_publish_every_n_channels = int(os.environ.get("EPG_PUBLISH_EVERY_N_CHANNELS", "200"))
+        self.epg_freshness_ttl_seconds = float(
+            os.environ.get("EPG_FRESHNESS_TTL_SECONDS", str(self.listing_cache_ttl_seconds))
+        )
 
 
 try:
