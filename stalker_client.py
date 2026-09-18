@@ -42,12 +42,12 @@ class StalkerClient:
         self._session: Optional[Session] = None
         self._auth_failed_until_by_role: dict[str, float] = {}
         self._auth_lock = asyncio.Lock()
-        self.http = httpx.AsyncClient(timeout=15.0)
+        self.http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
 
     def _headers(self, token: str = "") -> dict:
         headers = {
             "Cookie": f"mac={self.config.mac_address}; stb_lang=en; timezone=GMT",
-            "Referer": f"http://{self.config.host}/stalker_portal/c/",
+            "Referer": f"{self.config.scheme}://{self.config.host}/stalker_portal/c/",
             "User-Agent": (
                 "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 "
                 "(KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3"
@@ -72,7 +72,7 @@ class StalkerClient:
 
     async def _get_token(self) -> str:
         url = (
-            f"http://{self.config.host}/stalker_portal/server/load.php"
+            f"{self.config.scheme}://{self.config.host}/stalker_portal/server/load.php"
             "?type=stb&action=handshake&token=&JsHttpRequest=1-xml"
         )
         data = await self._get_json(url)
@@ -92,7 +92,7 @@ class StalkerClient:
         }
         metrics_encoded = urllib.parse.quote(json.dumps(metrics))
         url = (
-            f"http://{self.config.host}/stalker_portal/server/load.php?type=stb&action=get_profile"
+            f"{self.config.scheme}://{self.config.host}/stalker_portal/server/load.php?type=stb&action=get_profile"
             "&hd=1&ver=ImageDescription:%200.2.18-r14-pub-250;"
             "%20PORTAL%20version:%205.5.0;%20API%20Version:%20328;"
             f"&num_banks=2&sn={self.config.serial_number}"
@@ -108,7 +108,7 @@ class StalkerClient:
 
     async def _handshake(self, token: str) -> str:
         url = (
-            f"http://{self.config.host}/stalker_portal/server/load.php"
+            f"{self.config.scheme}://{self.config.host}/stalker_portal/server/load.php"
             f"?type=stb&action=handshake&token={token}&JsHttpRequest=1-xml"
         )
         data = await self._get_json(url)
@@ -119,7 +119,7 @@ class StalkerClient:
 
     async def _get_account_info(self, token: str) -> dict:
         url = (
-            f"http://{self.config.host}/stalker_portal/server/load.php"
+            f"{self.config.scheme}://{self.config.host}/stalker_portal/server/load.php"
             "?type=account_info&action=get_main_info&JsHttpRequest=1-xml"
         )
         data = await self._get_json(url, token)

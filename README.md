@@ -35,7 +35,8 @@ Copy `.env.example` to `.env` and fill in your portal details:
 cp .env.example .env
 ```
 
-Required: `STALKER_HOST`, `STALKER_MAC`, `STALKER_SERIAL`.
+Required: `STALKER_HOST` (plain host, or prefixed with `http://`/`https://` if your
+portal requires https — plain host defaults to `http://`), `STALKER_MAC`, `STALKER_SERIAL`.
 Optional: `STALKER_DEVICE_ID`, `STALKER_DEVICE_ID2` (some portals don't require them),
 `STALKER_STB_TYPE` (default `MAG250`), `STALKER_API_SIGNATURE` (default `263`),
 `LOG_LEVEL` (default `INFO`), `BLOCKED_CATEGORY_NAMES` (comma-separated, case-insensitive
@@ -149,6 +150,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000
   way as the listing cache. The background crawl uses its own HTTP connection pool,
   separate from real-time proxied traffic, so a slow/hung crawl request can't compete with
   real devices for a connection.
+- HTTP redirects from the portal (e.g. a domain move, or an `http`→`https` upgrade) are
+  followed automatically rather than treated as a failure.
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
 - Intended for LAN use across your own devices on your own account.
 

@@ -34,9 +34,9 @@ client = StalkerClient(config)
 # hung/slow crawl request can never compete with real-time traffic for a connection out of
 # the same pool. Auth/session state is still fully shared via `client` -- see
 # `_get_valid_session`'s `role` param for why the crawl doesn't get its own login.
-crawl_http = httpx.AsyncClient(timeout=15.0)
+crawl_http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
 
-UPSTREAM_BASE = f"http://{config.host}"
+UPSTREAM_BASE = f"{config.scheme}://{config.host}"
 
 # Headers that must not be blindly relayed from the upstream response, since the
 # ASGI server recalculates transport-level framing itself.

@@ -16,7 +16,16 @@ def _require(name: str) -> str:
 
 class Config:
     def __init__(self):
-        self.host = _require("STALKER_HOST").removeprefix("https://").removeprefix("http://").rstrip("/")
+        host_raw = _require("STALKER_HOST").rstrip("/")
+        if host_raw.startswith("https://"):
+            self.scheme = "https"
+            self.host = host_raw.removeprefix("https://")
+        elif host_raw.startswith("http://"):
+            self.scheme = "http"
+            self.host = host_raw.removeprefix("http://")
+        else:
+            self.scheme = "http"
+            self.host = host_raw
         self.mac_address = _require("STALKER_MAC")
         self.serial_number = _require("STALKER_SERIAL")
         self.device_id = os.environ.get("STALKER_DEVICE_ID", "").strip()
