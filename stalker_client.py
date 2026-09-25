@@ -32,6 +32,36 @@ def _md5(value: str) -> str:
 
 
 AUTH_FAILURE_COOLDOWN_SECONDS = 10.0
+MAX_REDIRECTS = 5
+
+
+async def request_with_redirects(
+    http: httpx.AsyncClient, method: str, url: str, config: Config, **kwargs
+) -> httpx.Response:
+    """Send a request, following redirects by hand instead of via httpx's built-in
+    `follow_redirects`.
+
+    httpx's own redirect handling strips the `Cookie` header on every redirect and
+    the `Authorization` header on any cross-origin redirect -- both of which this
+    proxy sets by hand to identify/authenticate the account, and both of which the
+    portal requires. This provider also periodically moves to an entirely
+    different domain via a redirect rather than serving directly, so treating a
+    redirect as a failure isn't an option either. Instead, follow it manually with
+    the original headers intact, and update `config.host`/`config.scheme` in place
+    to the resolved destination so later requests go there directly instead of
+    paying the redirect hop (and this same header-loss risk) every time.
+    """
+    current_url = url
+    for _ in range(MAX_REDIRECTS):
+        response = await http.request(method, current_url, **kwargs)
+        if response.status_code in (301, 302, 303, 307, 308) and "location" in response.headers:
+            redirect_url = httpx.URL(current_url).join(response.headers["location"])
+            config.scheme = redirect_url.scheme
+            config.host = redirect_url.netloc.decode("ascii")
+            current_url = str(redirect_url)
+            continue
+        return response
+    raise httpx.TooManyRedirects(f"Exceeded redirect limit for {url}")
 
 
 class StalkerClient:
@@ -42,7 +72,7 @@ class StalkerClient:
         self._session: Optional[Session] = None
         self._auth_failed_until_by_role: dict[str, float] = {}
         self._auth_lock = asyncio.Lock()
-        self.http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+        self.http = httpx.AsyncClient(timeout=15.0)
 
     def _headers(self, token: str = "") -> dict:
         headers = {
@@ -60,7 +90,9 @@ class StalkerClient:
 
     async def _get_json(self, url: str, token: str = "") -> Any:
         try:
-            response = await self.http.get(url, headers=self._headers(token))
+            response = await request_with_redirects(
+                self.http, "GET", url, self.config, headers=self._headers(token)
+            )
         except httpx.HTTPError as e:
             raise PortalError(f"Request failed: {e}") from e
         if response.status_code != 200:

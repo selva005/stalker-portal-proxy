@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, Response
 
 from config import config
 from epg import EMPTY_XMLTV, build_xmltv
-from stalker_client import PortalError, StalkerClient
+from stalker_client import PortalError, StalkerClient, request_with_redirects
 
 logging.basicConfig(
     level=config.log_level,
@@ -34,9 +34,13 @@ client = StalkerClient(config)
 # hung/slow crawl request can never compete with real-time traffic for a connection out of
 # the same pool. Auth/session state is still fully shared via `client` -- see
 # `_get_valid_session`'s `role` param for why the crawl doesn't get its own login.
-crawl_http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+crawl_http = httpx.AsyncClient(timeout=15.0)
 
-UPSTREAM_BASE = f"{config.scheme}://{config.host}"
+
+def _upstream_base() -> str:
+    # config.scheme/config.host can change at runtime -- see request_with_redirects()
+    # in stalker_client.py -- so this must be recomputed on every call, not cached.
+    return f"{config.scheme}://{config.host}"
 
 # Headers that must not be blindly relayed from the upstream response, since the
 # ASGI server recalculates transport-level framing itself.
@@ -345,9 +349,9 @@ async def _fetch_and_cache(
     headers: dict, params: list[tuple[str, str]], http: httpx.AsyncClient = None
 ) -> bytes | None:
     http = http or client.http
-    url = f"{UPSTREAM_BASE}/stalker_portal/server/load.php"
+    url = f"{_upstream_base()}/stalker_portal/server/load.php"
     try:
-        response = await http.get(url, params=params, headers=headers)
+        response = await request_with_redirects(http, "GET", url, config, params=params, headers=headers)
     except httpx.HTTPError as e:
         logger.warning("Pre-warm request failed for %s: %s", params, e)
         return None
@@ -564,7 +568,7 @@ async def _build_epg() -> None:
         # Note: xmltv_id is NOT required here -- get_epg_info answers are keyed by the
         # channel's numeric id, not xmltv_id. Only the /epg.xml XMLTV document needs
         # xmltv_id, and build_xmltv() already skips channels without one on its own.
-        url = f"{UPSTREAM_BASE}/stalker_portal/server/load.php"
+        url = f"{_upstream_base()}/stalker_portal/server/load.php"
         params = [
             ("type", "itv"),
             ("action", "get_short_epg"),
@@ -573,7 +577,9 @@ async def _build_epg() -> None:
             ("JsHttpRequest", "1-xml"),
         ]
         try:
-            response = await crawl_http.get(url, params=params, headers=headers)
+            response = await request_with_redirects(
+                crawl_http, "GET", url, config, params=params, headers=headers
+            )
             should_abort, consecutive_rate_limits = await _handle_rate_limit(
                 response, consecutive_rate_limits
             )
@@ -645,16 +651,18 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
             return Response(content=content, status_code=cached.status_code, media_type=cached.content_type)
 
     session = await _get_valid_session()
-    url = f"{UPSTREAM_BASE}{upstream_path}"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _EXCLUDED_REQUEST_HEADERS}
     headers["Cookie"] = f"mac={config.mac_address}; stb_lang=en; timezone=GMT"
     headers["Authorization"] = f"Bearer {session.token}"
     body = await request.body()
 
     async def do_request() -> httpx.Response:
-        return await client.http.request(
+        url = f"{_upstream_base()}{upstream_path}"
+        return await request_with_redirects(
+            client.http,
             request.method,
             url,
+            config,
             params=request.query_params,
             headers=headers,
             content=body or None,

@@ -151,7 +151,11 @@ uvicorn main:app --host 0.0.0.0 --port 8000
   separate from real-time proxied traffic, so a slow/hung crawl request can't compete with
   real devices for a connection.
 - HTTP redirects from the portal (e.g. a domain move, or an `http`→`https` upgrade) are
-  followed automatically rather than treated as a failure.
+  followed automatically rather than treated as a failure, preserving the account's
+  identifying headers across the hop (httpx's own redirect handling would otherwise
+  silently drop them on any cross-domain redirect, breaking auth without an obvious
+  error). The resolved host is also remembered for later requests, so only the first
+  request after a portal-side domain move pays the extra hop.
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
 - Intended for LAN use across your own devices on your own account.
 
