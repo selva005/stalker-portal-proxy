@@ -59,8 +59,11 @@ _CATEGORY_LISTING_ACTIONS = {"get_genres", "get_categories"}
 # still containing items in that category -- both need filtering for a category to
 # actually disappear from what the app can see, not just lose its display name.
 _ITEM_LISTING_FIELDS = {
-    "get_all_channels": "tv_genre_id",
-    "get_ordered_list": "category_id",
+    ("itv", "get_all_channels"): "tv_genre_id",
+    # Live channels listed per genre carry tv_genre_id, unlike VOD/series items' category_id.
+    ("itv", "get_ordered_list"): "tv_genre_id",
+    ("vod", "get_ordered_list"): "category_id",
+    ("series", "get_ordered_list"): "category_id",
 }
 
 # Populated from whatever category/genre listing content has been seen (fresh or cached),
@@ -332,9 +335,10 @@ def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered
         if filtered and _FILTERING_ENABLED:
             return _filter_categories(content)
         return content
-    if action in _ITEM_LISTING_FIELDS:
+    id_field = _ITEM_LISTING_FIELDS.get((req_type, action))
+    if id_field:
         if filtered:
-            content = _filter_items(content, req_type, _ITEM_LISTING_FIELDS[action])
+            content = _filter_items(content, req_type, id_field)
         if req_type == "itv":
             content = _mark_hd_channels(content)
     return content
