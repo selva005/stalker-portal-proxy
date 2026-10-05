@@ -153,6 +153,7 @@ def _compile_whole_word_patterns(names: list[str]) -> list[re.Pattern]:
 _BLOCKED_PATTERNS = _compile_whole_word_patterns(config.blocked_category_names)
 _ALLOWED_PATTERNS = _compile_whole_word_patterns(config.allowed_category_names)
 _FILTERING_ENABLED = bool(_BLOCKED_PATTERNS or _ALLOWED_PATTERNS)
+_HD_NAME_PATTERNS = _compile_whole_word_patterns(["hd", "fhd", "uhd", "4k"])
 
 
 def _is_blocked_category(title: str) -> bool:
@@ -211,6 +212,28 @@ def _filter_items(content: bytes, req_type: str, id_field: str) -> bytes:
         return content
     js["data"] = [item for item in items if str(item.get(id_field)) not in blocked_ids]
     return json.dumps(data).encode()
+
+
+def _mark_hd_channels(content: bytes) -> bytes:
+    """Set `hd` on channels whose name carries an HD/FHD/UHD/4K tag.
+
+    This portal reports hd=0 for every channel, even ones named "... HD", so apps never
+    show an HD badge. Only ever turns the flag on: an untagged name proves nothing.
+    """
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return content
+    js = data.get("js")
+    items = js.get("data") if isinstance(js, dict) else None
+    if not isinstance(items, list):
+        return content
+    changed = False
+    for item in items:
+        if str(item.get("hd")) != "1" and any(p.search(item.get("name") or "") for p in _HD_NAME_PATTERNS):
+            item["hd"] = "1"
+            changed = True
+    return json.dumps(data).encode() if changed else content
 
 
 async def _get_valid_session(role: str = "realtime", max_age: float = None):
@@ -309,8 +332,11 @@ def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered
         if filtered and _FILTERING_ENABLED:
             return _filter_categories(content)
         return content
-    if filtered and action in _ITEM_LISTING_FIELDS:
-        return _filter_items(content, req_type, _ITEM_LISTING_FIELDS[action])
+    if action in _ITEM_LISTING_FIELDS:
+        if filtered:
+            content = _filter_items(content, req_type, _ITEM_LISTING_FIELDS[action])
+        if req_type == "itv":
+            content = _mark_hd_channels(content)
     return content
 
 

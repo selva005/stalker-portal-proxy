@@ -173,6 +173,12 @@ uvicorn main:app --host 0.0.0.0 --port 8000
   silently drop them on any cross-domain redirect, breaking auth without an obvious
   error). The resolved host is also remembered for later requests, so only the first
   request after a portal-side domain move pays the extra hop.
+- Live TV channel listings (`get_all_channels`, live-TV `get_ordered_list`) get their `hd`
+  flag set to `1` when the channel name contains `HD`, `FHD`, `UHD` or `4K` as a whole
+  word. Some portals report `hd=0` for every channel even when the name says HD, which
+  leaves apps with no HD badge. The flag is only ever turned on; a name without a tag
+  doesn't mean the channel is SD, so those keep whatever the portal sent. Applies to both
+  the filtered and `/unfiltered/` endpoints; the cache itself keeps the portal's raw data.
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
 - Intended for LAN use across your own devices on your own account.
 
