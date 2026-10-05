@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -69,6 +70,13 @@ _ITEM_LISTING_FIELDS = {
 # Populated from whatever category/genre listing content has been seen (fresh or cached),
 # keyed by portal type ("itv", "vod", "series") -> set of blocked category ids.
 _blocked_category_ids: dict[str, set] = {}
+
+# Live channels this portal serves only per genre (observed: censored/adult ones are left out
+# of get_all_channels but listed by get_ordered_list&genre=ID). Apps that ask per genre
+# (TiviMate) already see them; apps that load the whole list once and group it by genre
+# themselves (StbEmu) never would, so they are merged back into get_all_channels responses.
+# Rebuilt by _discover_per_genre_only_channels on every background sync, not persisted.
+_extra_live_channels: list[dict] = []
 
 # Read-heavy, slow-changing listing actions worth caching to cut down on repeated
 # portal hits from multiple TVs (or repeated app refreshes) requesting the same data.
@@ -217,26 +225,18 @@ def _filter_items(content: bytes, req_type: str, id_field: str) -> bytes:
     return json.dumps(data).encode()
 
 
-def _mark_hd_channels(content: bytes) -> bytes:
-    """Set `hd` on channels whose name carries an HD/FHD/UHD/4K tag.
+def _mark_hd_in_items(items: list[dict]) -> bool:
+    """Set `hd` on channels whose name carries an HD/FHD/UHD/4K tag; True if any changed.
 
     This portal reports hd=0 for every channel, even ones named "... HD", so apps never
     show an HD badge. Only ever turns the flag on: an untagged name proves nothing.
     """
-    try:
-        data = json.loads(content)
-    except ValueError:
-        return content
-    js = data.get("js")
-    items = js.get("data") if isinstance(js, dict) else None
-    if not isinstance(items, list):
-        return content
     changed = False
     for item in items:
         if str(item.get("hd")) != "1" and any(p.search(item.get("name") or "") for p in _HD_NAME_PATTERNS):
             item["hd"] = "1"
             changed = True
-    return json.dumps(data).encode() if changed else content
+    return changed
 
 
 async def _get_valid_session(role: str = "realtime", max_age: float = None):
@@ -336,12 +336,47 @@ def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered
             return _filter_categories(content)
         return content
     id_field = _ITEM_LISTING_FIELDS.get((req_type, action))
-    if id_field:
-        if filtered:
-            content = _filter_items(content, req_type, id_field)
-        if req_type == "itv":
-            content = _mark_hd_channels(content)
-    return content
+    if not id_field:
+        return content
+    blocked_ids = _blocked_category_ids.get(req_type) if filtered else None
+    merge_extras = (req_type, action) == ("itv", "get_all_channels") and bool(_extra_live_channels)
+    mark_hd = req_type == "itv"
+    if not (blocked_ids or merge_extras or mark_hd):
+        return content
+
+    # One parse and one serialize for all the steps: this list is several MB, and the
+    # parse/dump blocks the event loop.
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return content
+    js = data.get("js")
+    items = js.get("data") if isinstance(js, dict) else None
+    if not isinstance(items, list):
+        return content
+
+    changed = False
+    if merge_extras:
+        present = {str(item.get("id")) for item in items}
+        extras = [c for c in _extra_live_channels if str(c.get("id")) not in present]
+        if extras:
+            items = items + extras
+            changed = True
+            if "total_items" in js:
+                try:
+                    js["total_items"] = type(js["total_items"])(int(js["total_items"]) + len(extras))
+                except (TypeError, ValueError):
+                    pass
+    if blocked_ids:
+        kept = [item for item in items if str(item.get(id_field)) not in blocked_ids]
+        changed = changed or len(kept) != len(items)
+        items = kept
+    if mark_hd:
+        changed = _mark_hd_in_items(items) or changed
+    if not changed:
+        return content
+    js["data"] = items
+    return json.dumps(data).encode()
 
 
 # Live TV is small enough (genres + one get_all_channels call) to fully auto-sync in the
@@ -423,6 +458,99 @@ async def _fetch_and_cache(
     return response.content
 
 
+class _DiscoveryIncomplete(Exception):
+    pass
+
+
+_MAX_DISCOVERY_PAGES_PER_GENRE = 200
+
+
+def _to_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _discover_per_genre_only_channels(
+    headers: dict, genres_content: bytes, channels_content: bytes
+) -> None:
+    """Find live channels that get_ordered_list serves per genre but get_all_channels omits.
+
+    Compares each genre's per-genre total with how many of its channels get_all_channels
+    has, and pages through only the genres that fall short. Replaces _extra_live_channels
+    only if the whole pass completes, so a rate limit or error midway keeps the last
+    complete result instead of dropping channels.
+    """
+    global _extra_live_channels
+    try:
+        genres = json.loads(genres_content).get("js")
+        all_items = json.loads(channels_content).get("js", {}).get("data")
+    except (ValueError, AttributeError):
+        return
+    if not isinstance(genres, list) or not isinstance(all_items, list):
+        return
+
+    all_ids = {str(c.get("id")) for c in all_items}
+    visible_per_genre: dict[str, int] = {}
+    for c in all_items:
+        key = str(c.get("tv_genre_id"))
+        visible_per_genre[key] = visible_per_genre.get(key, 0) + 1
+
+    async def fetch_genre_page(genre_id: str, page: int) -> dict | None:
+        response = await request_with_redirects(
+            crawl_http,
+            "GET",
+            f"{_upstream_base()}/stalker_portal/server/load.php",
+            config,
+            params=[
+                ("type", "itv"),
+                ("action", "get_ordered_list"),
+                ("genre", genre_id),
+                ("p", str(page)),
+                ("JsHttpRequest", "1-xml"),
+            ],
+            headers=headers,
+        )
+        await _handle_rate_limit(response, 0)
+        if response.status_code != 200:
+            raise _DiscoveryIncomplete(f"genre {genre_id} page {page} returned HTTP {response.status_code}")
+        await asyncio.sleep(config.prewarm_delay_seconds)
+        js = response.json().get("js")
+        return js if isinstance(js, dict) else None
+
+    found: dict[str, dict] = {}
+    try:
+        for genre in genres:
+            genre_id = str(genre.get("id"))
+            if not genre_id.isdigit():
+                continue
+            first = await fetch_genre_page(genre_id, 1)
+            if first is None:
+                continue
+            total = _to_int(first.get("total_items"))
+            if total <= visible_per_genre.get(genre_id, 0):
+                continue
+            first_items = first.get("data") if isinstance(first.get("data"), list) else []
+            per_page = _to_int(first.get("max_page_items")) or len(first_items) or 1
+            last_page = min(math.ceil(total / per_page), _MAX_DISCOVERY_PAGES_PER_GENRE)
+            for page in range(1, last_page + 1):
+                js = first if page == 1 else await fetch_genre_page(genre_id, page)
+                data = (js or {}).get("data")
+                for item in data if isinstance(data, list) else []:
+                    if str(item.get("id")) not in all_ids:
+                        found[str(item.get("id"))] = item
+    except (httpx.HTTPError, _DiscoveryIncomplete, ValueError, AttributeError) as e:
+        logger.warning("Per-genre channel discovery incomplete, keeping previous result: %s", e)
+        return
+
+    _extra_live_channels = list(found.values())
+    logger.info(
+        "Found %d live channel(s) served only per genre; merging them into get_all_channels responses",
+        len(_extra_live_channels),
+    )
+
+
 async def _prewarm_all() -> None:
     try:
         session = await _get_valid_session(role="crawl")
@@ -435,14 +563,21 @@ async def _prewarm_all() -> None:
         "Authorization": f"Bearer {session.token}",
     }
 
+    live_content: dict[str, bytes | None] = {}
     for req_type, action in _LIVE_TV_PREWARM_ENDPOINTS:
         content = await _fetch_and_cache(
             headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")], http=crawl_http
         )
+        live_content[action] = content
         if content and action == "get_genres":
             _update_blocked_category_ids(req_type, content)
         logger.info("Pre-warmed live TV: type=%s action=%s", req_type, action)
         await asyncio.sleep(config.prewarm_delay_seconds)
+
+    if live_content.get("get_genres") and live_content.get("get_all_channels"):
+        await _discover_per_genre_only_channels(
+            headers, live_content["get_genres"], live_content["get_all_channels"]
+        )
 
     for req_type, action in _CATALOG_PREWARM_ENDPOINTS:
         content = await _fetch_and_cache(

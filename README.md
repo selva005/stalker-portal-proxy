@@ -179,6 +179,16 @@ uvicorn main:app --host 0.0.0.0 --port 8000
   leaves apps with no HD badge. The flag is only ever turned on; a name without a tag
   doesn't mean the channel is SD, so those keep whatever the portal sent. Applies to both
   the filtered and `/unfiltered/` endpoints; the cache itself keeps the portal's raw data.
+- Some portals leave certain live channels (observed: censored/adult ones) out of
+  `get_all_channels` but still list them per genre (`get_ordered_list&genre=ID`). Apps that
+  ask per genre (TiviMate) see them; apps that load the whole list once and group it by
+  genre themselves (StbEmu) would show those genres empty. Each background sync therefore
+  compares every genre's per-genre total with `get_all_channels` (one request per genre,
+  paced by `PREWARM_DELAY_SECONDS`, plus extra pages for genres that fall short) and merges
+  the missing channels into the `get_all_channels` responses. Your allow/block lists still
+  apply to them. The result isn't persisted, so after a restart those genres stay empty in
+  such apps until the first sync's live-TV step finishes (about a minute); if a sync is
+  interrupted or rate-limited, the previous result is kept.
 - Logs go to stdout (`docker logs`); control verbosity with `LOG_LEVEL`.
 - Intended for LAN use across your own devices on your own account.
 
