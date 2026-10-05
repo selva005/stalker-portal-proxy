@@ -14,6 +14,10 @@ def _require(name: str) -> str:
     return value
 
 
+def _parse_name_list(name: str) -> list[str]:
+    return [item.strip().lower() for item in os.environ.get(name, "").split(",") if item.strip()]
+
+
 class Config:
     def __init__(self):
         host_raw = _require("STALKER_HOST").rstrip("/")
@@ -33,11 +37,8 @@ class Config:
         self.stb_type = os.environ.get("STALKER_STB_TYPE", "MAG250")
         self.api_signature = os.environ.get("STALKER_API_SIGNATURE", "263")
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
-        self.blocked_category_names = [
-            name.strip().lower()
-            for name in os.environ.get("BLOCKED_CATEGORY_NAMES", "").split(",")
-            if name.strip()
-        ]
+        self.blocked_category_names = _parse_name_list("BLOCKED_CATEGORY_NAMES")
+        self.allowed_category_names = _parse_name_list("ALLOWED_CATEGORY_NAMES")
         self.listing_cache_ttl_seconds = float(os.environ.get("LISTING_CACHE_TTL_SECONDS", "21600"))
         self.prewarm_delay_seconds = float(os.environ.get("PREWARM_DELAY_SECONDS", "0.3"))
         self.prewarm_vod_series_pages = int(os.environ.get("PREWARM_VOD_SERIES_PAGES", "3"))

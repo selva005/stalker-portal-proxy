@@ -40,8 +40,10 @@ portal requires https — plain host defaults to `http://`), `STALKER_MAC`, `STA
 Optional: `STALKER_DEVICE_ID`, `STALKER_DEVICE_ID2` (some portals don't require them),
 `STALKER_STB_TYPE` (default `MAG250`), `STALKER_API_SIGNATURE` (default `263`),
 `LOG_LEVEL` (default `INFO`), `BLOCKED_CATEGORY_NAMES` (comma-separated, case-insensitive
-substrings to hide from live TV genre / VOD category / series category listings, e.g.
-`ADULT,XXX`), `LISTING_CACHE_TTL_SECONDS` (default `21600` / 6 hours, how long to cache
+whole-word names to hide from live TV genre / VOD category / series category listings, e.g.
+`ADULT,XXX`), `ALLOWED_CATEGORY_NAMES` (allowlist, same matching — when set, only matching
+categories are shown; see [Category filtering](#category-filtering)),
+`LISTING_CACHE_TTL_SECONDS` (default `21600` / 6 hours, how long to cache
 listing responses and how often the background auto-sync re-runs), `PREWARM_DELAY_SECONDS`
 (default `0.3`, delay between requests during auto-sync), `PREWARM_VOD_SERIES_PAGES`
 (default `3`, how many pages of each VOD/series category to auto-sync), `CACHE_FILE_PATH`
@@ -75,13 +77,28 @@ proxy using the real account's credentials.
 
 ### Filtered vs. unfiltered endpoint
 
-- `http://<homeserver-lan-ip>:8000/` — category filtering applied (per `BLOCKED_CATEGORY_NAMES`):
-  blocked categories are hidden from genre/category listings, AND channels/VOD/series items
-  tagged with a blocked category are removed from the channel/item listings too (not just
-  hidden from the category name list — the content itself is filtered out).
+- `http://<homeserver-lan-ip>:8000/` — category filtering applied (per `BLOCKED_CATEGORY_NAMES`
+  and `ALLOWED_CATEGORY_NAMES`): hidden categories are removed from genre/category
+  listings, AND channels/VOD/series items tagged with a hidden category are removed from
+  the channel/item listings too (not just hidden from the category name list — the content
+  itself is filtered out).
 - `http://<homeserver-lan-ip>:8000/unfiltered/` — same account, same session, but never
   filters anything. Point a specific TV/profile here if you want the full, unfiltered
   catalog on that device.
+
+### Category filtering
+
+Both lists are comma-separated, case-insensitive, and match **whole words**: a name matches
+when it appears in the category title with no letter or digit directly on either side. So
+`IN` matches `IN TAMIL`, `TAMIL|IN` and `TAMIL-IN`, but not `INDIA` or `BEGIN`. A name that
+ends in punctuation, like `US|`, only enforces the boundary on its letter/digit edges, so it
+matches `US|NEWS` (and not `RUS|NEWS`).
+
+- `BLOCKED_CATEGORY_NAMES` — hide categories matching any name.
+- `ALLOWED_CATEGORY_NAMES` — when set, hide every category that does **not** match any name.
+  This is the easier option when the list you'd have to block is long, but it also hides
+  categories the provider adds later until you add them here.
+- If both are set, a category must match the allowlist and not match the blocklist.
 
 ### EPG
 

@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from urllib.parse import urlencode
@@ -134,9 +135,32 @@ def _load_cache_from_disk() -> None:
     logger.info("Loaded %d cache entries from %s", loaded, config.cache_file_path)
 
 
+def _compile_whole_word_patterns(names: list[str]) -> list[re.Pattern]:
+    """Compile each name to a case-insensitive whole-word pattern.
+
+    Letters/digits on either side of the name block a match ("IN" matches "IN TAMIL" and
+    "TAMIL|IN" but not "INDIA"). The boundary is only enforced on an edge that is itself a
+    letter/digit, so a name ending in punctuation like "US|" still matches "US|NEWS".
+    """
+    patterns = []
+    for name in names:
+        left = r"(?<![^\W_])" if name[0].isalnum() else ""
+        right = r"(?![^\W_])" if name[-1].isalnum() else ""
+        patterns.append(re.compile(f"{left}{re.escape(name)}{right}", re.IGNORECASE))
+    return patterns
+
+
+_BLOCKED_PATTERNS = _compile_whole_word_patterns(config.blocked_category_names)
+_ALLOWED_PATTERNS = _compile_whole_word_patterns(config.allowed_category_names)
+_FILTERING_ENABLED = bool(_BLOCKED_PATTERNS or _ALLOWED_PATTERNS)
+
+
 def _is_blocked_category(title: str) -> bool:
-    title_lower = title.lower()
-    return any(blocked in title_lower for blocked in config.blocked_category_names)
+    """True if the category should be hidden: it matches the blocklist, or an allowlist
+    is configured and it doesn't match it (blocklist wins if a title matches both)."""
+    if any(p.search(title) for p in _BLOCKED_PATTERNS):
+        return True
+    return bool(_ALLOWED_PATTERNS) and not any(p.search(title) for p in _ALLOWED_PATTERNS)
 
 
 def _update_blocked_category_ids(req_type: str, content: bytes) -> None:
@@ -146,7 +170,7 @@ def _update_blocked_category_ids(req_type: str, content: bytes) -> None:
     of whether the current request is filtered or not, so the mapping is always kept
     current from whichever source populated it first.
     """
-    if not config.blocked_category_names:
+    if not _FILTERING_ENABLED:
         return
     try:
         data = json.loads(content)
@@ -282,7 +306,7 @@ def _upstream_path(request_path: str) -> str:
 def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered: bool) -> bytes:
     if action in _CATEGORY_LISTING_ACTIONS:
         _update_blocked_category_ids(req_type, content)
-        if filtered and config.blocked_category_names:
+        if filtered and _FILTERING_ENABLED:
             return _filter_categories(content)
         return content
     if filtered and action in _ITEM_LISTING_FIELDS:
