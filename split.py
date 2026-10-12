@@ -1,11 +1,18 @@
-"""Split mixed movie/TV-show VOD categories into a movies view and a "(SERIES)" view.
+"""Split mixed VOD categories into separate views: movies, TV shows and adult entries.
 
 Some portals keep TV shows (is_series=1) inside ordinary VOD categories next to movies.
 TiviMate files each category under Movies or TV Shows and can't draw the other kind of
-entry, so a mixed category shows blank tiles. For categories that are mostly movies but
-contain shows, the filtered endpoint serves the original category with only its movies and a
-virtual "<title> (SERIES)" category with only its shows, both re-sliced into full pages with
-exact totals.
+entry, so a mixed category shows blank tiles. Adult entries (flagged `censored`) are mixed
+into ordinary categories too. A category is therefore served as up to four:
+
+  movies        the original category id: clean movies
+  shows         id + 1,000,000, "<title> (SERIES)": clean shows
+  adult_movies  id + 2,000,000, "Adult | <title>": adult movies
+  adult_shows   id + 3,000,000, "Adult | <title> (SERIES)": adult shows
+
+Only non-empty views exist, and each is re-sliced into full pages with an exact total. A
+category that is entirely adult is not split into adult views: it keeps its id and is simply
+labelled (the `adult` flag on the entry, or the caller's own rename when nothing else splits).
 
 Everything here is independent of the network and of main.py's globals: the crawl takes an
 injected page fetcher, and the lookups take the index as an argument.
@@ -18,16 +25,25 @@ import os
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Mapping
 
+import adult
+
 logger = logging.getLogger("split")
 
 ID_OFFSET = 1_000_000
+# The view each virtual id offset (in multiples of ID_OFFSET) stands for; the real id is "movies".
+_OFFSET_BUCKETS = {1: "shows", 2: "adult_movies", 3: "adult_shows"}
+_BUCKET_OFFSETS = {bucket: offset for offset, bucket in _OFFSET_BUCKETS.items()}
+BUCKETS = ("movies", "shows", "adult_movies", "adult_shows")
 TITLE_SUFFIX = " (SERIES)"
 # The orders TiviMate requests: the default one (home rows) and newest first (the grid).
 SORTS = ("", "added")
 # The only request shape that is rewritten; anything else (movie_id, search, other
 # filters...) goes to the portal untouched.
 _REQUEST_PARAMS = {"type", "action", "category", "genre", "sortby", "p", "JsHttpRequest"}
-_FILE_VERSION = 1
+# Live per-genre listings. The stock STB sends a few more parameters; they only change the
+# channel set when fav/hd are on, and the order is the portal's default either way.
+_LIVE_PARAMS = {"type", "action", "genre", "p", "JsHttpRequest", "sortby", "fav", "hd", "force_ch_link_check"}
+_FILE_VERSION = 2
 
 
 class TooLarge(Exception):
@@ -38,8 +54,8 @@ class TooLarge(Exception):
 class SplitCategory:
     title: str
     template: dict  # a portal page without "data": keeps total_items/max_page_items types
-    movies: dict[str, list[dict]]  # sortby -> entries in the portal's order
-    shows: dict[str, list[dict]]
+    buckets: dict[str, dict[str, list[dict]]]  # view -> sortby -> entries in the portal's order
+    adult: bool = False  # the whole category is adult: its own title carries the prefix
 
 
 def is_show(item: dict) -> bool:
@@ -53,7 +69,7 @@ def looks_mixed(sample: list[dict]) -> bool:
 
 
 def probe_pages(pages: int, sampled: int, count: int) -> list[int]:
-    """Extra pages to look at in a category whose first `sampled` pages held no show.
+    """Extra pages to look at in a category whose first `sampled` pages held nothing of interest.
 
     All remaining pages if there are at most `count` of them, otherwise `count` pages spread
     evenly from the first one after the sample to the last.
@@ -68,17 +84,19 @@ def probe_pages(pages: int, sampled: int, count: int) -> list[int]:
     return sorted({sampled + 1 + round(i * (remaining - 1) / (count - 1)) for i in range(count)})
 
 
-def virtual_id(category_id: str) -> str:
-    return str(int(category_id) + ID_OFFSET)
+def virtual_id(category_id: str, bucket: str) -> str:
+    return str(int(category_id) + _BUCKET_OFFSETS[bucket] * ID_OFFSET)
 
 
-def real_id(category_id) -> str | None:
-    """The real category id behind a virtual one, or None if it isn't virtual."""
+def split_id(category_id) -> tuple[str, str] | None:
+    """(real id, view) for a virtual category id, or None if it isn't one."""
     try:
         number = int(category_id)
     except (TypeError, ValueError):
         return None
-    return str(number - ID_OFFSET) if number >= ID_OFFSET else None
+    offset, real = divmod(number, ID_OFFSET)
+    bucket = _OFFSET_BUCKETS.get(offset)
+    return (str(real), bucket) if bucket and real > 0 else None
 
 
 def is_splittable_id(category_id) -> bool:
@@ -97,8 +115,14 @@ def _same_type(example, value: int):
     return str(value) if isinstance(example, str) else value
 
 
-def add_virtual_categories(content: bytes, index: Mapping[str, SplitCategory]) -> bytes:
-    """Insert a "<title> (SERIES)" entry after each split category in a category listing."""
+def view_title(entry: SplitCategory, bucket: str, prefix: str) -> str:
+    """The title a view is listed under."""
+    title = adult.prefixed(entry.title, prefix) if prefix and (entry.adult or bucket.startswith("adult_")) else entry.title
+    return title + TITLE_SUFFIX if bucket.endswith("shows") else title
+
+
+def add_virtual_categories(content: bytes, index: Mapping[str, SplitCategory], prefix: str) -> bytes:
+    """Insert each split category's extra views after it in a category listing."""
     if not index:
         return content
     try:
@@ -111,14 +135,18 @@ def add_virtual_categories(content: bytes, index: Mapping[str, SplitCategory]) -
     out, added = [], False
     for category in categories:
         out.append(category)
-        if isinstance(category, dict) and str(category.get("id")) in index:
-            new_id = virtual_id(str(category["id"]))
-            out.append({
-                **category,
-                "id": new_id if isinstance(category["id"], str) else int(new_id),
-                "title": f"{category.get('title', '')}{TITLE_SUFFIX}",
-            })
-            added = True
+        entry = index.get(str(category.get("id"))) if isinstance(category, dict) else None
+        if entry is None:
+            continue
+        for bucket in BUCKETS[1:]:
+            if bucket in entry.buckets:
+                new_id = virtual_id(str(category["id"]), bucket)
+                out.append({
+                    **category,
+                    "id": new_id if isinstance(category["id"], str) else int(new_id),
+                    "title": view_title(SplitCategory(str(category.get("title", "")), entry.template, entry.buckets, entry.adult), bucket, prefix),
+                })
+                added = True
     if not added:
         return content
     data["js"] = out
@@ -126,23 +154,34 @@ def add_virtual_categories(content: bytes, index: Mapping[str, SplitCategory]) -
 
 
 def page_response(
-    params: Mapping[str, str], index: Mapping[str, SplitCategory], is_blocked: Callable[[str, str], bool]
+    params: Mapping[str, str],
+    index: Mapping[str, SplitCategory],
+    is_blocked: Callable[[str, str], bool],
+    prefix: str,
+    *,
+    live: bool = False,
 ) -> dict | None:
     """The `js` of a re-sliced page for a request on a split category, or None to pass it through.
 
-    `is_blocked(title, real_category_id)` says whether the category as listed (the movies view
-    under its own title, the shows view under "<title> (SERIES)") is hidden by the block/allow
-    lists; a hidden category is passed through so the usual item filtering applies.
+    `is_blocked(title, real_category_id)` says whether the view, under the title it is listed
+    with, is hidden by the block/allow lists; a hidden view is passed through so the usual item
+    filtering applies. `live` selects live TV genres (`type=itv`, `genre=`) instead of VOD
+    categories (`type=vod`, `category=`).
     """
-    if params.get("type") != "vod" or params.get("action") != "get_ordered_list":
+    if params.get("type") != ("itv" if live else "vod") or params.get("action") != "get_ordered_list":
         return None
-    if not set(params) <= _REQUEST_PARAMS:
+    if not set(params) <= (_LIVE_PARAMS if live else _REQUEST_PARAMS):
         return None
-    if params.get("genre", "0") not in ("", "0"):
-        return None
-    sortby = params.get("sortby", "")
-    if sortby not in SORTS:
-        return None
+    if live:
+        if params.get("fav", "0") not in ("", "0") or params.get("hd", "0") not in ("", "0"):
+            return None
+        sortby = SORTS[0]
+    else:
+        if params.get("genre", "0") not in ("", "0"):
+            return None
+        sortby = params.get("sortby", "")
+        if sortby not in SORTS:
+            return None
     try:
         page = int(params.get("p", "1"))
     except ValueError:
@@ -150,17 +189,20 @@ def page_response(
     if page < 1:
         return None
 
-    category = params.get("category", "")
-    entry, view, original = index.get(category), "movies", category
+    category = params.get("genre" if live else "category", "")
+    entry, bucket, original = index.get(category), "movies", category
     if entry is None:
-        original = real_id(category)
-        entry, view = (index.get(original) if original else None), "shows"
-    if entry is None:
+        parsed = split_id(category)
+        if parsed is None:
+            return None
+        original, bucket = parsed
+        entry = index.get(original)
+    if entry is None or bucket not in entry.buckets:
         return None
-    if is_blocked(entry.title if view == "movies" else entry.title + TITLE_SUFFIX, original):
+    if is_blocked(view_title(entry, bucket, prefix), original):
         return None
 
-    items = (entry.movies if view == "movies" else entry.shows)[sortby]
+    items = entry.buckets[bucket][sortby]
     per_page = _to_int(entry.template.get("max_page_items")) or 14
     js = dict(entry.template)
     js["total_items"] = _same_type(entry.template.get("total_items", 0), len(items))
@@ -216,21 +258,48 @@ async def crawl(fetch_page: FetchPage, *, max_pages: int, concurrency: int, dela
     return {key: value for key, value in first.items() if key != "data"}, items
 
 
-def build_category(title: str, crawls: Mapping[str, tuple[dict, list[dict]]]) -> SplitCategory:
-    """Partition each crawled order into movies and shows."""
-    return SplitCategory(
-        title=title,
-        template=crawls[SORTS[0]][0],
-        movies={sort: [i for i in items if not is_show(i)] for sort, (_, items) in crawls.items()},
-        shows={sort: [i for i in items if is_show(i)] for sort, (_, items) in crawls.items()},
-    )
+def build_category(
+    title: str,
+    crawls: Mapping[str, tuple[dict, list[dict]]],
+    *,
+    category_adult: bool,
+    adult_enabled: bool,
+) -> tuple[SplitCategory | None, bool]:
+    """Partition a fully crawled category into views.
+
+    Returns (entry, whole_adult). `entry` is None when the category needs no split. A category is
+    whole-adult when the portal flags it (`category_adult`) or every entry is censored; then there
+    are no adult views, the category itself is the adult one. Otherwise censored entries form
+    their own group. Within each group shows are split off only when the group is mostly movies
+    with at least one show (the rule that keeps a show-heavy category's few movies in place).
+    """
+    first = crawls[SORTS[0]][1]
+    whole = adult_enabled and (category_adult or (bool(first) and all(adult.is_censored(i) for i in first)))
+
+    def group(item: dict) -> str:
+        return "adult" if adult_enabled and not whole and adult.is_censored(item) else "main"
+
+    split_shows = {g: looks_mixed([i for i in first if group(i) == g]) for g in ("main", "adult")}
+
+    def bucket(item: dict) -> str:
+        shows = is_show(item) and split_shows[group(item)]
+        return ("adult_" if group(item) == "adult" else "") + ("shows" if shows else "movies")
+
+    buckets: dict[str, dict[str, list[dict]]] = {}
+    for sort, (_, items) in crawls.items():
+        for item in items:
+            buckets.setdefault(bucket(item), {s: [] for s in crawls})[sort].append(item)
+    ordered = {name: buckets[name] for name in BUCKETS if name in buckets}
+    if len(ordered) <= 1:
+        return None, whole
+    return SplitCategory(title=title, template=crawls[SORTS[0]][0], buckets=ordered, adult=whole), whole
 
 
 def save(index: Mapping[str, SplitCategory], path: str) -> None:
     payload = {
         "version": _FILE_VERSION,
         "categories": {
-            category_id: {"title": e.title, "template": e.template, "movies": e.movies, "shows": e.shows}
+            category_id: {"title": e.title, "template": e.template, "adult": e.adult, "buckets": e.buckets}
             for category_id, e in index.items()
         },
     }
@@ -246,15 +315,21 @@ def load(path: str) -> dict[str, SplitCategory]:
             payload = json.load(f)
     except (OSError, ValueError):
         return {}
-    if not isinstance(payload, dict) or payload.get("version") != _FILE_VERSION:
+    if not isinstance(payload, dict) or payload.get("version") not in (1, _FILE_VERSION):
         return {}
     index = {}
     for category_id, raw in (payload.get("categories") or {}).items():
         try:
-            movies, shows = raw["movies"], raw["shows"]
-            if not all(sort in movies and sort in shows for sort in SORTS):
+            if payload["version"] == 1:  # movies/shows only, from before adult entries were split out
+                buckets = {"movies": raw["movies"], "shows": raw["shows"]}
+                buckets = {name: views for name, views in buckets.items() if any(views.values())}
+            else:
+                buckets = raw["buckets"]
+            if "movies" not in buckets or not all(
+                name in BUCKETS and all(sort in views for sort in SORTS) for name, views in buckets.items()
+            ):
                 continue
-            index[str(category_id)] = SplitCategory(raw["title"], raw["template"], movies, shows)
-        except (KeyError, TypeError):
+            index[str(category_id)] = SplitCategory(raw["title"], raw["template"], buckets, bool(raw.get("adult", False)))
+        except (KeyError, TypeError, AttributeError):
             continue
     return index

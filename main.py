@@ -85,6 +85,8 @@ _extra_live_channels: list[dict] = []
 # for the filtered endpoint (see split.py), keyed by real category id. Rebuilt by
 # _refresh_split_index on every background sync and persisted next to the listing cache.
 _split_index: dict[str, split.SplitCategory] = {}
+# The same for live TV genres (adult channels moved to an "Adult | <genre>" genre), keyed by real genre id.
+_live_split_index: dict[str, split.SplitCategory] = {}
 
 # Ids of the categories that hold censored content, by portal type ("itv", "vod", "series"): the
 # ones the portal flags plus the ones whose entries are flagged. Rebuilt by the background sync and
@@ -164,12 +166,18 @@ def _split_file_path() -> str:
     return config.cache_file_path + ".split.json"
 
 
+def _live_split_file_path() -> str:
+    return config.cache_file_path + ".livesplit.json"
+
+
 def _load_split_from_disk() -> None:
-    global _split_index
+    global _split_index, _live_split_index
     _split_index = split.load(_split_file_path())
-    if _split_index:
-        logger.info("Loaded %d split categor%s from %s", len(_split_index),
-                    "y" if len(_split_index) == 1 else "ies", _split_file_path())
+    _live_split_index = split.load(_live_split_file_path())
+    if _split_index or _live_split_index:
+        logger.info("Loaded %d split categor%s and %d split live genre%s from disk",
+                    len(_split_index), "y" if len(_split_index) == 1 else "ies",
+                    len(_live_split_index), "" if len(_live_split_index) == 1 else "s")
 
 
 def _adult_file_path() -> str:
@@ -193,14 +201,12 @@ def _save_adult_to_disk() -> None:
 
 def _mark_adult(content: bytes, req_type: str) -> bytes:
     """Prefix the adult categories in a category listing (every endpoint, before any filtering)."""
-    resolve = (lambda category_id: split.real_id(category_id) or category_id) if req_type == "vod" else str
+    resolve = (lambda category_id: (split.split_id(category_id) or (category_id,))[0]) if req_type == "vod" else str
     return adult.mark_categories(content, _adult_category_ids.get(req_type, ()), config.adult_category_prefix, resolve)
 
 
 def _is_blocked_split_title(title: str, real_category_id: str) -> bool:
-    # The split index stores portal titles; the lists see the prefixed ones.
-    if real_category_id in _adult_category_ids.get("vod", ()):
-        title = adult.prefixed(title, config.adult_category_prefix)
+    # split.view_title already carries the adult prefix where it applies.
     return _is_blocked_category(title)
 
 
@@ -389,9 +395,11 @@ def _upstream_path(request_path: str) -> str:
 
 def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered: bool) -> bytes:
     if action in _CATEGORY_LISTING_ACTIONS:
-        if req_type == "vod" and config.split_mixed_categories:
+        if req_type in ("vod", "itv") and config.split_mixed_categories:
             # Both endpoints: the split only restructures, it hides nothing.
-            content = split.add_virtual_categories(content, _split_index)
+            content = split.add_virtual_categories(
+                content, _split_index if req_type == "vod" else _live_split_index, config.adult_category_prefix
+            )
         content = _mark_adult(content, req_type)
         _update_blocked_category_ids(req_type, content)
         if filtered and _FILTERING_ENABLED:
@@ -403,7 +411,12 @@ def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered
     blocked_ids = _blocked_category_ids.get(req_type) if filtered else None
     merge_extras = (req_type, action) == ("itv", "get_all_channels") and bool(_extra_live_channels)
     mark_hd = req_type == "itv"
-    if not (blocked_ids or merge_extras or mark_hd):
+    # Adult channels of a split genre are listed under its adult genre (apps that group the whole
+    # list by tv_genre_id themselves, like StbEmu, then show them there).
+    remap_adult = (
+        (req_type, action) == ("itv", "get_all_channels") and config.split_mixed_categories and bool(_live_split_index)
+    )
+    if not (blocked_ids or merge_extras or mark_hd or remap_adult):
         return content
 
     # One parse and one serialize for all the steps: this list is several MB, and the
@@ -429,6 +442,13 @@ def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered
                     js["total_items"] = type(js["total_items"])(int(js["total_items"]) + len(extras))
                 except (TypeError, ValueError):
                     pass
+    if remap_adult:
+        for item in items:
+            entry = _live_split_index.get(str(item.get("tv_genre_id")))
+            if entry is not None and "adult_movies" in entry.buckets and adult.is_censored(item):
+                new_id = split.virtual_id(str(item["tv_genre_id"]), "adult_movies")
+                item["tv_genre_id"] = new_id if isinstance(item["tv_genre_id"], str) else int(new_id)
+                changed = True
     if blocked_ids:
         kept = [item for item in items if str(item.get(id_field)) not in blocked_ids]
         changed = changed or len(kept) != len(items)
@@ -641,6 +661,94 @@ async def _discover_per_genre_only_channels(
     )
 
 
+async def _fetch_live_page(headers: dict, genre_id: str, page: int) -> dict | None:
+    """One page of a live genre's channels as the portal lists them; its `js`, or None on any failure."""
+    url = f"{_upstream_base()}/stalker_portal/server/load.php"
+    params = [("type", "itv"), ("action", "get_ordered_list"), ("genre", genre_id), ("p", str(page))]
+    try:
+        response = await request_with_redirects(crawl_http, "GET", url, config, params=params, headers=headers)
+    except httpx.HTTPError as e:
+        logger.warning("Live split crawl request failed for genre %s page %d: %s", genre_id, page, e)
+        return None
+    await _handle_rate_limit(response, 0)
+    if response.status_code != 200:
+        logger.warning("Live split crawl got status %s for genre %s page %d", response.status_code, genre_id, page)
+        return None
+    try:
+        js = response.json().get("js")
+    except ValueError:
+        return None
+    return js if isinstance(js, dict) and isinstance(js.get("data"), list) else None
+
+
+async def _refresh_live_split(
+    headers: dict, genres_content: bytes, channels_content: bytes, adult_enabled: bool
+) -> set[str]:
+    """Work out which live genres hold adult channels, split the mixed ones, return the whole-adult ids.
+
+    A genre the portal flags is adult as a whole. One with some censored channels (among those in
+    get_all_channels and the per-genre-only ones the discovery found) is fetched in full: all
+    channels censored means whole-adult too, otherwise the censored ones move to a virtual
+    "Adult | <genre>" genre. When no crawl settles it (split off, too big, failed with nothing to
+    fall back on) a genre counts as adult only if every channel we know of is censored.
+    """
+    global _live_split_index
+    genres = _parse_categories(genres_content)
+    flagged = adult.flagged_categories(genres_content) if adult_enabled else set()
+    known: dict[str, list[dict]] = {}
+    for channel in _page_items(channels_content) + _extra_live_channels:
+        known.setdefault(str(channel.get("tv_genre_id")), []).append(channel)
+    previous_adult = _adult_category_ids.get("itv", set())
+    whole: set[str] = {genre_id for genre_id, _ in genres if genre_id in flagged}
+    fresh: dict[str, split.SplitCategory] = {}
+    for genre_id, title in genres if adult_enabled else []:
+        channels = known.get(genre_id, [])
+        if genre_id in flagged or not split.is_splittable_id(genre_id) or not any(adult.is_censored(c) for c in channels):
+            continue
+        outcome, crawled = "off", None
+        if config.split_mixed_categories:
+            try:
+                crawled = await split.crawl(
+                    functools.partial(_fetch_live_page, headers, genre_id),
+                    max_pages=config.split_max_pages,
+                    concurrency=config.split_crawl_concurrency,
+                    delay=config.prewarm_delay_seconds,
+                )
+                outcome = "ok" if crawled is not None else "failed"
+            except split.TooLarge as e:
+                logger.info("Not splitting live genre %r: %s (SPLIT_MAX_PAGES)", title, e)
+                outcome = "big"
+        if outcome == "ok":
+            entry, is_whole = split.build_category(
+                title, {sort: crawled for sort in split.SORTS}, category_adult=False, adult_enabled=True
+            )
+            if is_whole:
+                whole.add(genre_id)
+            if entry is not None:
+                fresh[genre_id] = entry
+            continue
+        if outcome == "failed" and (genre_id in _live_split_index or genre_id in previous_adult):
+            logger.warning("Could not refresh live genre %r; keeping its previous result", title)
+            if genre_id in _live_split_index:
+                fresh[genre_id] = _live_split_index[genre_id]
+            if genre_id in previous_adult:
+                whole.add(genre_id)
+            continue
+        if outcome == "failed":
+            logger.warning("Could not split live genre %r this cycle", title)
+        if all(adult.is_censored(c) for c in channels):
+            whole.add(genre_id)
+    _live_split_index = fresh
+    if fresh:
+        logger.info("Live split ready for %d genre%s: %s. Restart or refresh the playlist in the app to see them.",
+                    len(fresh), "" if len(fresh) == 1 else "s", "; ".join(_describe_split(e, live=True) for e in fresh.values()))
+    try:
+        await asyncio.to_thread(split.save, fresh, _live_split_file_path())
+    except OSError as e:
+        logger.warning("Failed to persist the live split index to disk: %s", e)
+    return whole
+
+
 async def _fetch_listing_page(headers: dict, category_id: str, sortby: str, page: int) -> dict | None:
     """One VOD category page, requested the way TiviMate does; its `js`, or None on any failure."""
     url = f"{_upstream_base()}/stalker_portal/server/load.php"
@@ -664,15 +772,29 @@ async def _fetch_listing_page(headers: dict, category_id: str, sortby: str, page
     return js if isinstance(js, dict) and isinstance(js.get("data"), list) else None
 
 
-async def _refresh_split_index(headers: dict, candidates: list[tuple[str, str]]) -> None:
-    """Crawl each mixed category and replace the split index with the result.
+def _describe_split(entry: split.SplitCategory, live: bool = False) -> str:
+    views = ", ".join(
+        f"{len(by_sort[''])} {name.replace('movies', 'channels' if live else 'movies').replace('_', ' ')}"
+        for name, by_sort in entry.buckets.items()
+    )
+    return f"{entry.title} ({views}{'; whole category adult' if entry.adult else ''})"
 
-    A category whose crawl fails keeps its previous entry, so a transient portal hiccup doesn't
-    bring the blank tiles back; a category that is no longer mixed is dropped.
+
+async def _refresh_split_index(
+    headers: dict, candidates: list[tuple[str, str, bool]], adult_enabled: bool
+) -> tuple[set[str], set[str]]:
+    """Crawl each candidate category and replace the split index with the result.
+
+    Candidates are (id, title, flagged_by_portal). Returns (whole_adult, crawled): the ids found
+    to be entirely adult, and the ids whose crawl succeeded (the authoritative ones). A category
+    whose crawl fails keeps its previous entry and adult status, so a transient portal hiccup
+    doesn't bring the blank tiles back; one that no longer needs a split is dropped.
     """
     global _split_index
     fresh: dict[str, split.SplitCategory] = {}
-    for category_id, title in candidates:
+    whole_adult: set[str] = set()
+    crawled_ok: set[str] = set()
+    for category_id, title, flagged in candidates:
         crawls = {}
         try:
             for sortby in split.SORTS:
@@ -689,33 +811,44 @@ async def _refresh_split_index(headers: dict, candidates: list[tuple[str, str]])
             logger.info("Not splitting %r: %s (SPLIT_MAX_PAGES)", title, e)
             continue
         if len(crawls) == len(split.SORTS):
-            fresh[category_id] = split.build_category(title, crawls)
-        elif category_id in _split_index:
-            fresh[category_id] = _split_index[category_id]
-            logger.warning("Could not refresh the split of %r; keeping the previous result", title)
+            entry, whole = split.build_category(title, crawls, category_adult=flagged, adult_enabled=adult_enabled)
+            crawled_ok.add(category_id)
+            if whole:
+                whole_adult.add(category_id)
+            if entry is not None:
+                fresh[category_id] = entry
         else:
-            logger.warning("Could not split %r this cycle; it is served as the portal sends it", title)
+            previous = _split_index.get(category_id)
+            was_adult = category_id in _adult_category_ids.get("vod", ())
+            if previous is not None:
+                fresh[category_id] = previous
+            if previous is not None or was_adult:
+                logger.warning("Could not refresh %r; keeping its previous result", title)
+                if was_adult:
+                    whole_adult.add(category_id)
+            else:
+                logger.warning("Could not split %r this cycle; it is served as the portal sends it", title)
     _split_index = fresh
     if fresh:
         logger.info(
-            "Split ready for %d mixed categor%s: %s. Restart or refresh the playlist in TiviMate to see them.",
-            len(fresh), "y" if len(fresh) == 1 else "ies",
-            ", ".join(f"{e.title} ({len(e.movies[''])} movies, {len(e.shows[''])} shows)" for e in fresh.values()),
+            "Split ready for %d categor%s: %s. Restart or refresh the playlist in the app to see them.",
+            len(fresh), "y" if len(fresh) == 1 else "ies", "; ".join(_describe_split(e) for e in fresh.values()),
         )
     try:
         await asyncio.to_thread(split.save, fresh, _split_file_path())
     except OSError as e:
         logger.warning("Failed to persist the split index to disk: %s", e)
+    return whole_adult, crawled_ok
 
 
-async def _probe_for_shows(
-    headers: dict, probes: list[tuple[str, str, list[dict], int]]
-) -> tuple[list[tuple[str, str]], set[str]]:
-    """Look at pages spread through categories whose first pages held no show.
+async def _probe_for_mixed(
+    headers: dict, probes: list[tuple[str, str, list[dict], int]], adult_enabled: bool
+) -> list[tuple[str, str, list[dict]]]:
+    """Look at pages spread through categories whose first pages held no show and nothing adult.
 
-    The pre-warmed sample is only the first few pages; a category whose shows come later (or
-    are sparse) would otherwise never be noticed. Returns the (id, title) of those that turn
-    out to be mixed, and the ids of those where a censored entry turned up.
+    The pre-warmed sample is only the first few pages; a category whose shows or adult entries
+    come later (or are sparse) would otherwise never be noticed. Returns (id, title, everything
+    seen) for those that turn out to hold shows (mostly movies) or adult entries.
     """
     gate = asyncio.Semaphore(max(1, config.split_crawl_concurrency))
 
@@ -725,18 +858,16 @@ async def _probe_for_shows(
             await asyncio.sleep(config.prewarm_delay_seconds)
             return js["data"] if js else []
 
-    found, censored = [], set()
+    found = []
     for category_id, title, sample, pages in probes:
         extra = await asyncio.gather(
             *(fetch(category_id, page)
               for page in split.probe_pages(pages, config.prewarm_vod_series_pages, config.split_probe_pages))
         )
         items = sample + [item for page_items in extra for item in page_items]
-        if split.looks_mixed(items):
-            found.append((category_id, title))
-        if any(adult.is_censored(item) for item in items):
-            censored.add(category_id)
-    return found, censored
+        if split.looks_mixed(items) or (adult_enabled and any(adult.is_censored(item) for item in items)):
+            found.append((category_id, title, items))
+    return found
 
 
 async def _prewarm_all() -> None:
@@ -751,6 +882,7 @@ async def _prewarm_all() -> None:
         "Authorization": f"Bearer {session.token}",
     }
 
+    adult_enabled = bool(config.adult_category_prefix)
     live_content: dict[str, bytes | None] = {}
     for req_type, action in _LIVE_TV_PREWARM_ENDPOINTS:
         content = await _fetch_and_cache(
@@ -766,18 +898,22 @@ async def _prewarm_all() -> None:
         await _discover_per_genre_only_channels(
             headers, live_content["get_genres"], live_content["get_all_channels"]
         )
-        # Genres the portal flags, plus those with a censored channel: the censored ones are left out of
-        # get_all_channels and found by the discovery above, so this sees all of them.
-        _adult_category_ids["itv"] = adult.flagged_categories(live_content["get_genres"]) | adult.censored_ids(
-            _page_items(live_content["get_all_channels"]) + _extra_live_channels, "tv_genre_id"
+        # The censored channels are left out of get_all_channels and found by the discovery above.
+        _adult_category_ids["itv"] = await _refresh_live_split(
+            headers, live_content["get_genres"], live_content["get_all_channels"], adult_enabled
         )
-        _update_blocked_category_ids("itv", _mark_adult(live_content["get_genres"], "itv"))
+        _update_blocked_category_ids("itv", _mark_adult(
+            split.add_virtual_categories(live_content["get_genres"], _live_split_index, config.adult_category_prefix), "itv"
+        ))
+        titles_by_type_live = dict(_parse_categories(live_content["get_genres"]))
 
-    split_candidates: list[tuple[str, str]] = []
+    candidates: list[tuple[str, str, bool]] = []  # (id, title, flagged by the portal)
+    all_adult_in_sample: set[str] = set()
     probes: list[tuple[str, str, list[dict], int]] = []
     vod_categories_seen = False
     catalog_content: dict[str, bytes] = {}
     adult_found: dict[str, set[str]] = {}
+    titles_by_type: dict[str, dict[str, str]] = {"itv": titles_by_type_live} if live_content.get("get_genres") and live_content.get("get_all_channels") else {}
     for req_type, action in _CATALOG_PREWARM_ENDPOINTS:
         content = await _fetch_and_cache(
             headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")], http=crawl_http
@@ -789,8 +925,10 @@ async def _prewarm_all() -> None:
             continue
         _update_blocked_category_ids(req_type, content)
         catalog_content[req_type] = content
-        adult_found[req_type] = adult.flagged_categories(content)
+        flagged_ids = adult.flagged_categories(content) if adult_enabled else set()
+        adult_found[req_type] = set(flagged_ids)  # the portal's own flag: the whole category is adult
         categories = _parse_categories(content)
+        titles_by_type[req_type] = dict(categories)
         for category_id, title in categories:
             sample: list[dict] = []
             pages = 0
@@ -811,12 +949,14 @@ async def _prewarm_all() -> None:
                     if page == 1:
                         pages = _page_count(page_content)
                 await asyncio.sleep(config.prewarm_delay_seconds)
-            if any(adult.is_censored(item) for item in sample):
-                adult_found[req_type].add(category_id)
             if req_type == "vod" and split.is_splittable_id(category_id):
-                if split.looks_mixed(sample):
-                    split_candidates.append((category_id, title))
-                elif (not any(split.is_show(item) for item in sample)
+                flagged = category_id in flagged_ids
+                has_adult = adult_enabled and any(adult.is_censored(item) for item in sample)
+                if has_adult and all(adult.is_censored(item) for item in sample):
+                    all_adult_in_sample.add(category_id)
+                if split.looks_mixed(sample) or (has_adult and not flagged):
+                    candidates.append((category_id, title, flagged))
+                elif (not flagged and not has_adult and not any(split.is_show(item) for item in sample)
                       and config.prewarm_vod_series_pages < pages <= config.split_max_pages):
                     probes.append((category_id, title, sample, pages))
         if req_type == "vod":
@@ -828,20 +968,24 @@ async def _prewarm_all() -> None:
 
     # Only when the category list was actually fetched: otherwise "no candidates" would just
     # mean the portal failed, and the previous split would be thrown away.
-    if config.split_mixed_categories and vod_categories_seen:
-        found, probe_adult = await _probe_for_shows(headers, probes)
-        adult_found["vod"] |= probe_adult
-        logger.info(
-            "Split detection: %d vod categories look mixed from their first %d pages; probed %d more with no "
-            "show there and found %d mixed",
-            len(split_candidates), config.prewarm_vod_series_pages, len(probes), len(found),
-        )
-        await _refresh_split_index(headers, split_candidates + found)
-        # Split categories were fetched in full, so a censored entry anywhere in one is seen.
-        adult_found["vod"] |= {
-            category_id for category_id, entry in _split_index.items()
-            if any(adult.is_censored(item) for item in entry.movies[""] + entry.shows[""])
-        }
+    if vod_categories_seen:
+        crawled: set[str] = set()
+        whole_adult: set[str] = set()
+        if config.split_mixed_categories:
+            found = await _probe_for_mixed(headers, probes, adult_enabled)
+            for category_id, title, items in found:
+                candidates.append((category_id, title, False))
+                if adult_enabled and all(adult.is_censored(item) for item in items):
+                    all_adult_in_sample.add(category_id)
+            logger.info(
+                "Split detection: %d vod categories look mixed or adult from their first %d pages; probed %d more "
+                "with neither and found %d",
+                len(candidates) - len(found), config.prewarm_vod_series_pages, len(probes), len(found),
+            )
+            whole_adult, crawled = await _refresh_split_index(headers, candidates, adult_enabled)
+        # What the crawl couldn't settle (too big, failed, or the split is off): a category whose
+        # every sampled entry is censored is taken to be adult as a whole.
+        adult_found["vod"] |= whole_adult | {i for i in all_adult_in_sample if i not in crawled}
 
     # A type whose category list couldn't be fetched keeps its previous ids.
     for req_type, ids in adult_found.items():
@@ -849,6 +993,10 @@ async def _prewarm_all() -> None:
         _update_blocked_category_ids(req_type, _mark_adult(catalog_content[req_type], req_type))
     await asyncio.to_thread(_save_adult_to_disk)
     logger.info("Adult categories: %s", ", ".join(f"{t}: {len(ids)}" for t, ids in sorted(_adult_category_ids.items())) or "none")
+    for req_type, ids in sorted(_adult_category_ids.items()):
+        names = [titles_by_type.get(req_type, {}).get(i, i) for i in sorted(ids, key=int if all(i.isdigit() for i in ids) else str)]
+        if names:
+            logger.info("Renamed with the adult prefix (%s): %s%s", req_type, ", ".join(names[:40]), " ..." if len(names) > 40 else "")
 
     await asyncio.to_thread(_save_cache_to_disk)
 
@@ -1076,10 +1224,12 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
     cacheable = request.method == "GET" and action in _CACHEABLE_ACTIONS
     cache_key = _cache_key(upstream_path, request.query_params.multi_items()) if cacheable else None
 
-    if config.split_mixed_categories and request.method == "GET" and _split_index:
+    live = req_type == "itv"
+    index = _live_split_index if live else _split_index
+    if config.split_mixed_categories and request.method == "GET" and index:
         # The block/allow lists only ever apply to the filtered endpoint.
         is_blocked = _is_blocked_split_title if filtered else (lambda title, category_id: False)
-        js = split.page_response(request.query_params, _split_index, is_blocked)
+        js = split.page_response(request.query_params, index, is_blocked, config.adult_category_prefix, live=live)
         if js is not None:
             return JSONResponse({"js": js})
 

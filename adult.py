@@ -1,27 +1,23 @@
-"""Label categories that hold censored content with an "Adult" title prefix.
+"""Label adult categories with an "Adult" title prefix.
 
-A category counts as adult when the portal flags it `censored`, or when entries inside it are
-flagged (observed: a live genre that says censored=0 whose channels are all censored=1). The
-title prefix is added to the listings the proxy serves, so it is visible to every app and, on
-the filtered endpoint, to the block/allow lists (BLOCKED_CATEGORY_NAMES=ADULT hides them all).
+A category that is adult as a whole (the portal flags it `censored`, or every entry in it is) is
+renamed in place. Categories that only hold some adult entries are not renamed: split.py moves
+those entries into a separate "Adult | <title>" category. The prefix is added to the listings the
+proxy serves, so it is visible to every app and, on the filtered endpoint, to the block/allow lists
+(BLOCKED_CATEGORY_NAMES=ADULT hides every adult category).
 
 Pure functions only: the caller decides which categories are adult and passes the ids in.
 """
 import json
 import os
 import re
-from typing import Callable, Collection, Iterable, Mapping
+from typing import Callable, Collection, Mapping
 
 _FILE_VERSION = 1
 
 
 def is_censored(entry) -> bool:
     return isinstance(entry, dict) and entry.get("censored") in (1, "1", True)
-
-
-def censored_ids(entries: Iterable[dict], id_field: str) -> set[str]:
-    """Ids (taken from `id_field`) of the entries that are flagged censored."""
-    return {str(e[id_field]) for e in entries if is_censored(e) and e.get(id_field) is not None}
 
 
 def _categories(content: bytes) -> list | None:

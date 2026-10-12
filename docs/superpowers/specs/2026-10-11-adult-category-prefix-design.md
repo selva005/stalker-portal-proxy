@@ -1,39 +1,48 @@
-# Adult category prefix
+# Adult content: prefix whole categories, split out the rest
 
 ## Problem
 
-The portal marks adult content with a `censored` flag, but not consistently: a category's own
-flag can say 0 while every entry inside is flagged (live genre ASSAM, 129 channels, all
-`censored=1`, hidden from `get_all_channels` and served only per genre). Apps show no hint, and
-hiding adult categories needs each one named in `BLOCKED_CATEGORY_NAMES`.
+The portal marks adult content with a `censored` flag, inconsistently: a category's own flag can
+say 0 while every entry inside is flagged (live genre ASSAM, 129 channels, all `censored=1`,
+omitted from `get_all_channels` and served only per genre), and many ordinary categories hold a few
+adult entries among clean ones. Apps show no hint, and hiding adult content needs each category
+named in `BLOCKED_CATEGORY_NAMES`. Renaming a whole category for one flagged entry would hide
+everything clean in it as soon as `ADULT` is blocked (an earlier version did exactly that).
 
 ## Behaviour
 
-- A category is *adult* if the portal flags it, or any entry in it is flagged.
-- Its title gets the prefix `Adult | ` (word configurable, empty turns it off) in every category
-  listing the proxy serves, filtered and `/unfiltered/` alike, for live genres and VOD
-  categories. A title that already starts with the prefix as a word is left alone. The virtual
-  `(SERIES)` copy of a split category is prefixed when its real category is adult.
-- The prefix is added before the block/allow lists run, so `BLOCKED_CATEGORY_NAMES=ADULT`
-  hides every adult category on the filtered endpoint, and the existing item filtering removes
-  their channels/entries. The split index applies the same rule to the titles it checks.
-- The cache keeps the portal's raw data; the label is applied to each response.
+- An entry is adult if it is flagged `censored`, or its category is flagged by the portal.
+- A category (VOD or live genre) that is adult as a whole (portal flag, or every entry flagged)
+  is renamed in place with the prefix `Adult | ` (configurable; empty turns the feature off).
+- A category with some adult entries keeps its clean entries; the adult ones move to a virtual
+  `Adult | <title>` category (id + 2,000,000), and adult shows to `Adult | <title> (SERIES)`
+  (id + 3,000,000). See the split design for the views and paging.
+- Both endpoints. The prefix is added before the block/allow lists run, so
+  `BLOCKED_CATEGORY_NAMES=ADULT` hides every adult piece on the filtered endpoint (and, through
+  the existing item filtering, its channels and entries) and leaves the clean remainders.
+- Live: in `get_all_channels` the adult channels of a split genre are listed under the adult
+  genre's id (apps like StbEmu group that list by `tv_genre_id` themselves); per-genre listings
+  are re-sliced. The portal's own per-genre-only channels come from the existing discovery step.
+- The cache keeps the portal's raw data; the labelling is applied to each response.
 
 ## How it is built
 
-- `adult.py` holds the pure parts: `is_censored`, `censored_ids`, `flagged_categories`,
-  `prefixed`, `mark_categories`, save/load.
-- The portal's own category flag is read from the listing itself and needs no state. Categories
-  found through their entries are kept in `_adult_category_ids` (by type), rebuilt by the
-  background sync from data it already fetches, with no extra requests:
-  live TV from `get_all_channels` plus the per-genre-only channels the discovery step merges;
-  VOD from the pre-warmed pages, the split probe pages and the categories crawled for the split.
-- A type whose category list could not be fetched keeps its previous ids. The ids are persisted
-  to `<CACHE_FILE_PATH>.adult.json` and loaded at startup, so a restart does not un-label
-  entry-derived categories (and, with ADULT blocked, show them) until the next sync.
+- `adult.py`: `is_censored`, `flagged_categories`, `prefixed`, `mark_categories`, save/load (pure).
+- `split.py` (see the split design): `build_category` partitions a fully crawled category into
+  clean/adult groups and, within each, movies/shows; whole-adult categories are reported to the
+  caller, which keeps their ids in `_adult_category_ids` (by type) for the in-place rename.
+- Detection costs no extra requests beyond the split's own: VOD from the pre-warmed pages and the
+  probe pages (shows or adult entries), then a full crawl of each candidate of at most
+  `SPLIT_MAX_PAGES` pages. Over the cap, a category is renamed only if the portal flags it or
+  every sampled entry is censored. Live: genres with a censored channel among those already known
+  are crawled; where no crawl settles it, a genre counts as adult only if every known channel is.
+- A failed crawl keeps the previous result and adult status. Everything is persisted
+  (`.split.json`, `.livesplit.json`, `.adult.json`) and loaded at startup, so a restart does not
+  show adult content unlabelled (and, with ADULT blocked, visible) until the next sync.
 
 ## Known limits
 
-- VOD detection by entries covers only the pages the sync reads; a category with a single
-  censored entry deep inside, on none of them, is not labelled unless the portal flags it.
-- With `SPLIT_MIXED_CATEGORIES=false` there are no probe pages, so VOD sees fewer pages.
+- Entries are found through sampled pages (probe), so a category with very few adult entries on
+  none of them is not split unless the portal flags it.
+- Splitting mixed live genres relies on recognising the app's per-genre request; one in a shape
+  the proxy doesn't recognise is passed through as the portal sends it.

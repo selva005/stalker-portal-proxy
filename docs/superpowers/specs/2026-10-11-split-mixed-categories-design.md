@@ -19,11 +19,14 @@ labels and works).
 On **both endpoints**. The split only restructures and hides nothing, so `/unfiltered/` gets it
 too (an app there that handled shows inline now finds them in the `(SERIES)` category):
 
-- A VOD category whose sample is mostly movies but contains at least one show is *mixed*.
-- The category list gets a virtual copy of each mixed category, titled `<title> (SERIES)`,
-  with id = real id + 1,000,000 (every other field copied).
-- The original category lists only its movies; the virtual one lists only its shows. Both are
-  re-sliced to the portal's page size with an exact `total_items`, so there are no gaps.
+- A VOD category whose sample is mostly movies but contains at least one show is *mixed*; so is
+  one whose sample holds adult entries (`censored`), which are split out the same way.
+- The category list gets virtual copies of each mixed category (every other field copied): shows
+  as `<title> (SERIES)` (id + 1,000,000), and, see the adult design, adult movies as
+  `Adult | <title>` (id + 2,000,000) and adult shows as `Adult | <title> (SERIES)` (id + 3,000,000).
+- The original category lists only its clean movies; each virtual one lists its own entries. All
+  are re-sliced to the portal's page size with an exact `total_items`, so there are no gaps. Shows
+  are split off a group (clean or adult) only when it is mostly movies with at least one show.
 - Only requests TiviMate actually sends are rewritten: `type=vod&action=get_ordered_list`
   with `category`, `genre` 0 or absent, `sortby` empty or `added`, and `p`. Anything else
   (`movie_id`, `season_id`, search, other sorts or filters) passes through untouched.

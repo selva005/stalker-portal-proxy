@@ -104,63 +104,70 @@ matches `US|NEWS` (and not `RUS|NEWS`).
   categories the provider adds later until you add them here.
 - If both are set, a category must match the allowlist and not match the blocklist.
 
-### Adult categories
+### Adult content and mixed categories
 
-A category is labelled adult when the portal flags it `censored`, or when entries inside it are
-flagged (observed: a live genre whose own flag says `censored=0` while all of its channels are
-`censored=1`). Its title then gets an `Adult | ` prefix, for example `Adult | ASSAM`, on both
-the filtered and the `/unfiltered/` endpoint. A title that already starts with "Adult" is left
-alone, and the `(SERIES)` copy of a split category gets the prefix too. `ADULT_CATEGORY_PREFIX`
-changes the word; set it to an empty value to turn the labelling off.
+**Adult entries.** An entry is adult when the portal flags it `censored`; every entry of a
+category the portal itself flags counts as adult (observed: live genre ASSAM says `censored=0`
+itself, but all 129 of its channels are `censored=1`, and the portal leaves them out of
+`get_all_channels`). The adult prefix is `Adult | ` (`ADULT_CATEGORY_PREFIX`; an empty value
+turns the labelling and the adult split off).
 
-The prefix is added before the block and allow lists run, so `BLOCKED_CATEGORY_NAMES=ADULT` now
-hides every adult category on the filtered endpoint, along with its channels and entries,
-without listing them one by one.
+- A category (VOD category or live genre) that is **entirely adult** is renamed in place:
+  `Adult | ASSAM`.
+- A category that is only **partly adult** is split: the adult entries move to their own
+  `Adult | <title>` category and the original keeps the rest.
 
-Detection costs no extra requests. Live TV looks at every channel, including the ones the portal
-only lists per genre, so it sees all of them. VOD looks at the pages the sync already reads: the
-first pages of every category, the probe pages, and the categories fetched in full for the
-split. A category with a single censored entry deep inside it, in none of those, can be missed.
-The categories found through their entries are saved next to the listing cache
-(`<CACHE_FILE_PATH>.adult.json`) and loaded at startup, so a restart doesn't lose them.
+**Shows in movie categories.** Some portals put TV shows (`is_series=1`) in ordinary VOD categories.
+TiviMate files each category under Movies or TV Shows and can't draw the other kind of entry, so
+a mixed category (observed: "KIDS DISNEY+", about a third shows) comes out with blank placeholder
+tiles. TiviMate opens a show's seasons and episodes natively once the show sits in a category it
+files under TV Shows, so the shows are split out too.
 
-### Mixed movie and TV-show categories
+A category can therefore become up to four, with only the non-empty ones listed. Every one is
+re-sliced into full pages with exact totals, so there are no gaps, and nothing is hidden:
 
-Some portals put TV shows in ordinary VOD categories and flag them `is_series=1`, next to the
-movies. TiviMate files each category under Movies or TV Shows and can't draw the other kind of
-entry, so a mixed category (observed: "KIDS DISNEY+", about a third shows) comes out with blank
-placeholder tiles between the entries that render. The data itself is fine; TiviMate opens a
-show's seasons and episodes natively once the show sits in a category it files under TV Shows.
+| view | id | title | holds |
+|---|---|---|---|
+| original | the real id | `<title>` | clean movies (live: clean channels) |
+| shows | id + 1,000,000 | `<title> (SERIES)` | clean shows |
+| adult movies | id + 2,000,000 | `Adult \| <title>` | adult movies (live: adult channels) |
+| adult shows | id + 3,000,000 | `Adult \| <title> (SERIES)` | adult shows |
 
-On both the filtered and the `/unfiltered/` endpoint the proxy fixes this by splitting such a
-category in two: the
-original lists only its movies, and a virtual `<name> (SERIES)` category (id = real id +
-1,000,000) lists only its shows. Both are re-sliced into full pages with exact totals, so there
-are no gaps, and nothing is hidden. Only TiviMate's own listing requests are rewritten (default
-order and `sortby=added`); season/episode lookups, search and other sort orders go to the portal
-untouched. The split only restructures, so `/unfiltered/` still lists everything; but an app on
-it that handles shows inline will now find them in the `(SERIES)` category instead. On the
-filtered endpoint, allow and block lists apply to both titles.
+Both endpoints get this, filtered and `/unfiltered/`. On the filtered endpoint the prefix is added
+before the block and allow lists run, so `BLOCKED_CATEGORY_NAMES=ADULT` hides every adult piece
+(and its channels and entries) while the clean remainder of a mixed category stays. `/unfiltered/`
+still lists everything; but an app on it that handled shows inline now finds them in the
+`(SERIES)` category. Only TiviMate's own listing requests are rewritten (default order and
+`sortby=added` for VOD; plain per-genre requests for live): season and episode lookups, search,
+favourites filters and other sort orders go to the portal untouched.
 
-It needs no list of categories. A category counts as mixed when the first pages the background
-sync already pre-warms (`PREWARM_VOD_SERIES_PAGES`, default 3) hold more movies than shows but
-at least one show. A category with no show there, of at most `SPLIT_MAX_PAGES` pages, gets
-`SPLIT_PROBE_PAGES` (default 8) more pages looked at, spread evenly through it (all of them if
-it has fewer), because shows are often sparse or come later in the alphabet. That adds a few
-hundred requests per sync. Each mixed category of at most `SPLIT_MAX_PAGES` pages is then
-fetched in full, `SPLIT_CRAWL_CONCURRENCY` pages at a time, in each sync (roughly 350 requests
-for the catalogue above, every `LISTING_CACHE_TTL_SECONDS`). The result is only used if every
-page arrived and the entries add up to the portal's own total; otherwise the previous result is
-kept, or the category is served as before. It is saved next to the listing cache
-(`<CACHE_FILE_PATH>.split.json`) and loaded at startup. The log line `Split detection: ...`
-reports what each sync found, even when nothing is mixed.
+**How they are found.** No list of categories is needed. For VOD, the first pages the background
+sync already pre-warms (`PREWARM_VOD_SERIES_PAGES`, default 3) are checked for shows and adult
+entries; a category with neither, of at most `SPLIT_MAX_PAGES` pages, gets `SPLIT_PROBE_PAGES`
+(default 8) more pages spread evenly through it (all of them if it has fewer), because both are
+often sparse. A category that shows up is then fetched in full, `SPLIT_CRAWL_CONCURRENCY` pages at
+a time, in each sync (the default order and `added`), so the split is exact. Within the clean and
+the adult group, shows are split off when that group is mostly movies with at least one show. The
+result is only used if every page arrived and the entries add up to the portal's own total;
+otherwise the previous result is kept, or the category is served as before.
 
+Live TV comes as one list that apps group by `tv_genre_id`, so a mixed genre is handled in both
+places: in `get_all_channels` the adult channels are listed under the adult genre's id, and the
+per-genre listing is re-sliced. The sync's discovery step supplies the censored channels the
+portal omits from `get_all_channels`; each genre with one is fetched in full.
+
+The results are saved next to the listing cache (`<CACHE_FILE_PATH>.split.json`, `.livesplit.json`
+and `.adult.json`) and loaded at startup, so a restart doesn't undo them. Each sync logs what it
+found: `Split detection`, `Split ready`, `Live split ready`, and the names renamed with the prefix.
 TiviMate re-reads the category list and the first page of every category when it starts, so
-restart it or refresh the playlist after the first sync (the log says `Split ready for ...`).
-Limits: a category whose shows are very rare (a few percent or less) can slip past the probe,
-categories over the page cap
-aren't split, and series-named categories with a few stray movies aren't covered. Set
-`SPLIT_MIXED_CATEGORIES=false` to turn the whole thing off.
+restart it or refresh the playlist after the first sync. `SPLIT_MIXED_CATEGORIES=false` turns the
+splitting off (a category then only gets the prefix when the portal flags it or everything we
+sampled in it is censored).
+
+Limits: a category whose shows or adult entries are very rare (a few percent or less) can slip past
+the probe; a category over the page cap can't be split (the prefix still applies if the portal flags
+it or all its sampled entries are censored); a show-heavy category keeps its few movies in place;
+and a live request in a shape the proxy doesn't recognise is passed to the portal as it is.
 
 ### EPG
 
