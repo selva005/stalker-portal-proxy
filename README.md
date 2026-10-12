@@ -43,8 +43,8 @@ Optional: `STALKER_DEVICE_ID`, `STALKER_DEVICE_ID2` (some portals don't require 
 whole-word names to hide from live TV genre / VOD category / series category listings, e.g.
 `ADULT,XXX`), `ALLOWED_CATEGORY_NAMES` (allowlist, same matching — when set, only matching
 categories are shown; see [Category filtering](#category-filtering)),
-`SPLIT_MIXED_CATEGORIES` (default `true`), `SPLIT_MAX_PAGES` (default `100`) and
-`SPLIT_CRAWL_CONCURRENCY` (default `3`), see [Mixed movie and TV-show
+`SPLIT_MIXED_CATEGORIES` (default `true`), `SPLIT_MAX_PAGES` (default `100`),
+`SPLIT_CRAWL_CONCURRENCY` (default `3`) and `SPLIT_PROBE_PAGES` (default `8`), see [Mixed movie and TV-show
 categories](#mixed-movie-and-tv-show-categories),
 `LISTING_CACHE_TTL_SECONDS` (default `21600` / 6 hours, how long to cache
 listing responses and how often the background auto-sync re-runs), `PREWARM_DELAY_SECONDS`
@@ -121,16 +121,21 @@ Allow and block lists apply to both titles.
 
 It needs no list of categories. A category counts as mixed when the first pages the background
 sync already pre-warms (`PREWARM_VOD_SERIES_PAGES`, default 3) hold more movies than shows but
-at least one show. Each mixed category of at most `SPLIT_MAX_PAGES` pages is then fetched in
-full, `SPLIT_CRAWL_CONCURRENCY` pages at a time, in each sync (roughly 350 requests for a
-catalogue like the one above, every `LISTING_CACHE_TTL_SECONDS`). The result is only used if every
+at least one show. A category with no show there, of at most `SPLIT_MAX_PAGES` pages, gets
+`SPLIT_PROBE_PAGES` (default 8) more pages looked at, spread evenly through it (all of them if
+it has fewer), because shows are often sparse or come later in the alphabet. That adds a few
+hundred requests per sync. Each mixed category of at most `SPLIT_MAX_PAGES` pages is then
+fetched in full, `SPLIT_CRAWL_CONCURRENCY` pages at a time, in each sync (roughly 350 requests
+for the catalogue above, every `LISTING_CACHE_TTL_SECONDS`). The result is only used if every
 page arrived and the entries add up to the portal's own total; otherwise the previous result is
 kept, or the category is served as before. It is saved next to the listing cache
-(`<CACHE_FILE_PATH>.split.json`) and loaded at startup.
+(`<CACHE_FILE_PATH>.split.json`) and loaded at startup. The log line `Split detection: ...`
+reports what each sync found, even when nothing is mixed.
 
 TiviMate re-reads the category list and the first page of every category when it starts, so
 restart it or refresh the playlist after the first sync (the log says `Split ready for ...`).
-Limits: a category whose first pages hold no show isn't detected, categories over the page cap
+Limits: a category whose shows are very rare (a few percent or less) can slip past the probe,
+categories over the page cap
 aren't split, and series-named categories with a few stray movies aren't covered. Set
 `SPLIT_MIXED_CATEGORIES=false` to turn the whole thing off.
 

@@ -427,6 +427,22 @@ def _parse_categories(content: bytes) -> list[tuple[str, str]]:
     return [(str(c["id"]), str(c.get("title", ""))) for c in categories if c.get("id") is not None]
 
 
+def _page_count(content: bytes | None) -> int:
+    """How many pages a category has, from its first page's totals (0 if unknown)."""
+    if not content:
+        return 0
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return 0
+    js = data.get("js") if isinstance(data, dict) else None
+    if not isinstance(js, dict):
+        return 0
+    total = _to_int(js.get("total_items"))
+    per_page = _to_int(js.get("max_page_items")) or (len(js["data"]) if isinstance(js.get("data"), list) else 0)
+    return math.ceil(total / per_page) if total and per_page else 0
+
+
 def _page_items(content: bytes | None) -> list[dict]:
     if not content:
         return []
@@ -651,6 +667,32 @@ async def _refresh_split_index(headers: dict, candidates: list[tuple[str, str]])
         logger.warning("Failed to persist the split index to disk: %s", e)
 
 
+async def _probe_for_shows(headers: dict, probes: list[tuple[str, str, list[dict], int]]) -> list[tuple[str, str]]:
+    """Look at pages spread through categories whose first pages held no show.
+
+    The pre-warmed sample is only the first few pages; a category whose shows come later (or
+    are sparse) would otherwise never be noticed. Returns the (id, title) of those that turn
+    out to be mixed.
+    """
+    gate = asyncio.Semaphore(max(1, config.split_crawl_concurrency))
+
+    async def fetch(category_id: str, page: int) -> list[dict]:
+        async with gate:
+            js = await _fetch_listing_page(headers, category_id, "", page)
+            await asyncio.sleep(config.prewarm_delay_seconds)
+            return js["data"] if js else []
+
+    found = []
+    for category_id, title, sample, pages in probes:
+        extra = await asyncio.gather(
+            *(fetch(category_id, page)
+              for page in split.probe_pages(pages, config.prewarm_vod_series_pages, config.split_probe_pages))
+        )
+        if split.looks_mixed(sample + [item for page_items in extra for item in page_items]):
+            found.append((category_id, title))
+    return found
+
+
 async def _prewarm_all() -> None:
     try:
         session = await _get_valid_session(role="crawl")
@@ -680,6 +722,7 @@ async def _prewarm_all() -> None:
         )
 
     split_candidates: list[tuple[str, str]] = []
+    probes: list[tuple[str, str, list[dict], int]] = []
     vod_categories_seen = False
     for req_type, action in _CATALOG_PREWARM_ENDPOINTS:
         content = await _fetch_and_cache(
@@ -694,6 +737,7 @@ async def _prewarm_all() -> None:
         categories = _parse_categories(content)
         for category_id, title in categories:
             sample: list[dict] = []
+            pages = 0
             for page in range(1, config.prewarm_vod_series_pages + 1):
                 page_content = await _fetch_and_cache(
                     headers,
@@ -708,9 +752,15 @@ async def _prewarm_all() -> None:
                 )
                 if req_type == "vod":
                     sample += _page_items(page_content)
+                    if page == 1:
+                        pages = _page_count(page_content)
                 await asyncio.sleep(config.prewarm_delay_seconds)
-            if req_type == "vod" and split.is_splittable_id(category_id) and split.looks_mixed(sample):
-                split_candidates.append((category_id, title))
+            if req_type == "vod" and split.is_splittable_id(category_id):
+                if split.looks_mixed(sample):
+                    split_candidates.append((category_id, title))
+                elif (not any(split.is_show(item) for item in sample)
+                      and config.prewarm_vod_series_pages < pages <= config.split_max_pages):
+                    probes.append((category_id, title, sample, pages))
         if req_type == "vod":
             vod_categories_seen = True
         logger.info(
@@ -721,7 +771,13 @@ async def _prewarm_all() -> None:
     # Only when the category list was actually fetched: otherwise "no candidates" would just
     # mean the portal failed, and the previous split would be thrown away.
     if config.split_mixed_categories and vod_categories_seen:
-        await _refresh_split_index(headers, split_candidates)
+        found = await _probe_for_shows(headers, probes)
+        logger.info(
+            "Split detection: %d vod categories look mixed from their first %d pages; probed %d more with no "
+            "show there and found %d mixed",
+            len(split_candidates), config.prewarm_vod_series_pages, len(probes), len(found),
+        )
+        await _refresh_split_index(headers, split_candidates + found)
 
     await asyncio.to_thread(_save_cache_to_disk)
 

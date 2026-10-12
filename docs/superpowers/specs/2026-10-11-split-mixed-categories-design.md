@@ -31,8 +31,11 @@ keep doing so):
 
 ## How it is built
 
-- **Detection** reuses the pages the background sync already pre-warms (first
-  `PREWARM_VOD_SERIES_PAGES`, default 3, of every category): no extra portal requests.
+- **Detection** starts from the pages the background sync already pre-warms (first
+  `PREWARM_VOD_SERIES_PAGES`, default 3, of every category). A category of at most
+  `SPLIT_MAX_PAGES` pages with no show there is probed: `SPLIT_PROBE_PAGES` (default 8) more
+  pages spread evenly through it (all of them if fewer), because shows are often sparse
+  (observed: 29 of 506 entries, none before page 4). A few hundred extra requests per sync.
 - **Crawl** of each mixed category of at most `SPLIT_MAX_PAGES` (default 100) pages happens in
   the same sync, `SPLIT_CRAWL_CONCURRENCY` (default 3) pages at a time with the usual pacing,
   once per order (default and `added`). The result is accepted only if every page arrived and
@@ -48,11 +51,11 @@ keep doing so):
 ## Configuration
 
 `SPLIT_MIXED_CATEGORIES` (default `true`, the kill switch), `SPLIT_MAX_PAGES` (100),
-`SPLIT_CRAWL_CONCURRENCY` (3). No category list to maintain.
+`SPLIT_CRAWL_CONCURRENCY` (3), `SPLIT_PROBE_PAGES` (8). No category list to maintain.
 
 ## Known limits
 
-- A category whose first sample pages hold no show is not detected.
+- A category whose shows are so rare that the probe pages miss them is not detected.
 - Categories over the page cap, such as one with 8,806 items, are not split.
 - Series-named categories with a few stray movies are not covered.
 - That TiviMate files the virtual category under TV Shows is expected (all shows, named

@@ -52,6 +52,22 @@ def looks_mixed(sample: list[dict]) -> bool:
     return 0 < shows < len(sample) - shows
 
 
+def probe_pages(pages: int, sampled: int, count: int) -> list[int]:
+    """Extra pages to look at in a category whose first `sampled` pages held no show.
+
+    All remaining pages if there are at most `count` of them, otherwise `count` pages spread
+    evenly from the first one after the sample to the last.
+    """
+    remaining = pages - sampled
+    if remaining <= 0 or count <= 0:
+        return []
+    if remaining <= count:
+        return list(range(sampled + 1, pages + 1))
+    if count == 1:
+        return [pages]
+    return sorted({sampled + 1 + round(i * (remaining - 1) / (count - 1)) for i in range(count)})
+
+
 def virtual_id(category_id: str) -> str:
     return str(int(category_id) + ID_OFFSET)
 
