@@ -43,6 +43,9 @@ Optional: `STALKER_DEVICE_ID`, `STALKER_DEVICE_ID2` (some portals don't require 
 whole-word names to hide from live TV genre / VOD category / series category listings, e.g.
 `ADULT,XXX`), `ALLOWED_CATEGORY_NAMES` (allowlist, same matching — when set, only matching
 categories are shown; see [Category filtering](#category-filtering)),
+`SPLIT_MIXED_CATEGORIES` (default `true`), `SPLIT_MAX_PAGES` (default `100`) and
+`SPLIT_CRAWL_CONCURRENCY` (default `3`), see [Mixed movie and TV-show
+categories](#mixed-movie-and-tv-show-categories),
 `LISTING_CACHE_TTL_SECONDS` (default `21600` / 6 hours, how long to cache
 listing responses and how often the background auto-sync re-runs), `PREWARM_DELAY_SECONDS`
 (default `0.3`, delay between requests during auto-sync), `PREWARM_VOD_SERIES_PAGES`
@@ -99,6 +102,37 @@ matches `US|NEWS` (and not `RUS|NEWS`).
   This is the easier option when the list you'd have to block is long, but it also hides
   categories the provider adds later until you add them here.
 - If both are set, a category must match the allowlist and not match the blocklist.
+
+### Mixed movie and TV-show categories
+
+Some portals put TV shows in ordinary VOD categories and flag them `is_series=1`, next to the
+movies. TiviMate files each category under Movies or TV Shows and can't draw the other kind of
+entry, so a mixed category (observed: "KIDS DISNEY+", about a third shows) comes out with blank
+placeholder tiles between the entries that render. The data itself is fine; TiviMate opens a
+show's seasons and episodes natively once the show sits in a category it files under TV Shows.
+
+On the filtered endpoint the proxy fixes this by splitting such a category in two: the
+original lists only its movies, and a virtual `<name> (SERIES)` category (id = real id +
+1,000,000) lists only its shows. Both are re-sliced into full pages with exact totals, so there
+are no gaps, and nothing is hidden. Only TiviMate's own listing requests are rewritten (default
+order and `sortby=added`); season/episode lookups, search and other sort orders go to the portal
+untouched. `/unfiltered/` is never changed, so apps that handle shows inline keep doing so.
+Allow and block lists apply to both titles.
+
+It needs no list of categories. A category counts as mixed when the first pages the background
+sync already pre-warms (`PREWARM_VOD_SERIES_PAGES`, default 3) hold more movies than shows but
+at least one show. Each mixed category of at most `SPLIT_MAX_PAGES` pages is then fetched in
+full, `SPLIT_CRAWL_CONCURRENCY` pages at a time, in each sync (roughly 350 requests for a
+catalogue like the one above, every `LISTING_CACHE_TTL_SECONDS`). The result is only used if every
+page arrived and the entries add up to the portal's own total; otherwise the previous result is
+kept, or the category is served as before. It is saved next to the listing cache
+(`<CACHE_FILE_PATH>.split.json`) and loaded at startup.
+
+TiviMate re-reads the category list and the first page of every category when it starts, so
+restart it or refresh the playlist after the first sync (the log says `Split ready for ...`).
+Limits: a category whose first pages hold no show isn't detected, categories over the page cap
+aren't split, and series-named categories with a few stray movies aren't covered. Set
+`SPLIT_MIXED_CATEGORIES=false` to turn the whole thing off.
 
 ### EPG
 

@@ -7,6 +7,7 @@ the real account's credentials injected.
 """
 import asyncio
 import base64
+import functools
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ from fastapi.responses import JSONResponse, Response
 
 from config import config
 from epg import EMPTY_XMLTV, build_xmltv
+import split
 from stalker_client import PortalError, StalkerClient, request_with_redirects
 
 logging.basicConfig(
@@ -77,6 +79,11 @@ _blocked_category_ids: dict[str, set] = {}
 # themselves (StbEmu) never would, so they are merged back into get_all_channels responses.
 # Rebuilt by _discover_per_genre_only_channels on every background sync, not persisted.
 _extra_live_channels: list[dict] = []
+
+# VOD categories that mix movies and TV shows, split into a movies view and a "(SERIES)" view
+# for the filtered endpoint (see split.py), keyed by real category id. Rebuilt by
+# _refresh_split_index on every background sync and persisted next to the listing cache.
+_split_index: dict[str, split.SplitCategory] = {}
 
 # Read-heavy, slow-changing listing actions worth caching to cut down on repeated
 # portal hits from multiple TVs (or repeated app refreshes) requesting the same data.
@@ -144,6 +151,18 @@ def _load_cache_from_disk() -> None:
         )
         loaded += 1
     logger.info("Loaded %d cache entries from %s", loaded, config.cache_file_path)
+
+
+def _split_file_path() -> str:
+    return config.cache_file_path + ".split.json"
+
+
+def _load_split_from_disk() -> None:
+    global _split_index
+    _split_index = split.load(_split_file_path())
+    if _split_index:
+        logger.info("Loaded %d split categor%s from %s", len(_split_index),
+                    "y" if len(_split_index) == 1 else "ies", _split_file_path())
 
 
 def _compile_whole_word_patterns(names: list[str]) -> list[re.Pattern]:
@@ -331,6 +350,8 @@ def _upstream_path(request_path: str) -> str:
 
 def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered: bool) -> bytes:
     if action in _CATEGORY_LISTING_ACTIONS:
+        if filtered and req_type == "vod" and config.split_mixed_categories:
+            content = split.add_virtual_categories(content, _split_index)
         _update_blocked_category_ids(req_type, content)
         if filtered and _FILTERING_ENABLED:
             return _filter_categories(content)
@@ -395,7 +416,7 @@ _CATALOG_PREWARM_ENDPOINTS = [
 ]
 
 
-def _parse_category_ids(content: bytes) -> list[str]:
+def _parse_categories(content: bytes) -> list[tuple[str, str]]:
     try:
         data = json.loads(content)
     except ValueError:
@@ -403,7 +424,19 @@ def _parse_category_ids(content: bytes) -> list[str]:
     categories = data.get("js")
     if not isinstance(categories, list):
         return []
-    return [str(c["id"]) for c in categories if c.get("id") is not None]
+    return [(str(c["id"]), str(c.get("title", ""))) for c in categories if c.get("id") is not None]
+
+
+def _page_items(content: bytes | None) -> list[dict]:
+    if not content:
+        return []
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return []
+    js = data.get("js") if isinstance(data, dict) else None
+    items = js.get("data") if isinstance(js, dict) else None
+    return items if isinstance(items, list) else []
 
 
 async def _handle_rate_limit(response: httpx.Response, consecutive: int) -> tuple[bool, int]:
@@ -551,6 +584,73 @@ async def _discover_per_genre_only_channels(
     )
 
 
+async def _fetch_listing_page(headers: dict, category_id: str, sortby: str, page: int) -> dict | None:
+    """One VOD category page, requested the way TiviMate does; its `js`, or None on any failure."""
+    url = f"{_upstream_base()}/stalker_portal/server/load.php"
+    params = [
+        ("type", "vod"), ("action", "get_ordered_list"), ("category", category_id),
+        ("genre", "0"), ("sortby", sortby), ("p", str(page)),
+    ]
+    try:
+        response = await request_with_redirects(crawl_http, "GET", url, config, params=params, headers=headers)
+    except httpx.HTTPError as e:
+        logger.warning("Split crawl request failed for category %s page %d: %s", category_id, page, e)
+        return None
+    await _handle_rate_limit(response, 0)
+    if response.status_code != 200:
+        logger.warning("Split crawl got status %s for category %s page %d", response.status_code, category_id, page)
+        return None
+    try:
+        js = response.json().get("js")
+    except ValueError:
+        return None
+    return js if isinstance(js, dict) and isinstance(js.get("data"), list) else None
+
+
+async def _refresh_split_index(headers: dict, candidates: list[tuple[str, str]]) -> None:
+    """Crawl each mixed category and replace the split index with the result.
+
+    A category whose crawl fails keeps its previous entry, so a transient portal hiccup doesn't
+    bring the blank tiles back; a category that is no longer mixed is dropped.
+    """
+    global _split_index
+    fresh: dict[str, split.SplitCategory] = {}
+    for category_id, title in candidates:
+        crawls = {}
+        try:
+            for sortby in split.SORTS:
+                crawled = await split.crawl(
+                    functools.partial(_fetch_listing_page, headers, category_id, sortby),
+                    max_pages=config.split_max_pages,
+                    concurrency=config.split_crawl_concurrency,
+                    delay=config.prewarm_delay_seconds,
+                )
+                if crawled is None:
+                    break
+                crawls[sortby] = crawled
+        except split.TooLarge as e:
+            logger.info("Not splitting %r: %s (SPLIT_MAX_PAGES)", title, e)
+            continue
+        if len(crawls) == len(split.SORTS):
+            fresh[category_id] = split.build_category(title, crawls)
+        elif category_id in _split_index:
+            fresh[category_id] = _split_index[category_id]
+            logger.warning("Could not refresh the split of %r; keeping the previous result", title)
+        else:
+            logger.warning("Could not split %r this cycle; it is served as the portal sends it", title)
+    _split_index = fresh
+    if fresh:
+        logger.info(
+            "Split ready for %d mixed categor%s: %s. Restart or refresh the playlist in TiviMate to see them.",
+            len(fresh), "y" if len(fresh) == 1 else "ies",
+            ", ".join(f"{e.title} ({len(e.movies[''])} movies, {len(e.shows[''])} shows)" for e in fresh.values()),
+        )
+    try:
+        await asyncio.to_thread(split.save, fresh, _split_file_path())
+    except OSError as e:
+        logger.warning("Failed to persist the split index to disk: %s", e)
+
+
 async def _prewarm_all() -> None:
     try:
         session = await _get_valid_session(role="crawl")
@@ -579,6 +679,8 @@ async def _prewarm_all() -> None:
             headers, live_content["get_genres"], live_content["get_all_channels"]
         )
 
+    split_candidates: list[tuple[str, str]] = []
+    vod_categories_seen = False
     for req_type, action in _CATALOG_PREWARM_ENDPOINTS:
         content = await _fetch_and_cache(
             headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")], http=crawl_http
@@ -589,10 +691,11 @@ async def _prewarm_all() -> None:
         if not content:
             continue
         _update_blocked_category_ids(req_type, content)
-        category_ids = _parse_category_ids(content)
-        for category_id in category_ids:
+        categories = _parse_categories(content)
+        for category_id, title in categories:
+            sample: list[dict] = []
             for page in range(1, config.prewarm_vod_series_pages + 1):
-                await _fetch_and_cache(
+                page_content = await _fetch_and_cache(
                     headers,
                     [
                         ("type", req_type),
@@ -603,11 +706,22 @@ async def _prewarm_all() -> None:
                     ],
                     http=crawl_http,
                 )
+                if req_type == "vod":
+                    sample += _page_items(page_content)
                 await asyncio.sleep(config.prewarm_delay_seconds)
+            if req_type == "vod" and split.is_splittable_id(category_id) and split.looks_mixed(sample):
+                split_candidates.append((category_id, title))
+        if req_type == "vod":
+            vod_categories_seen = True
         logger.info(
             "Pre-warmed first %d page(s) of %d %s categories",
-            config.prewarm_vod_series_pages, len(category_ids), req_type,
+            config.prewarm_vod_series_pages, len(categories), req_type,
         )
+
+    # Only when the category list was actually fetched: otherwise "no candidates" would just
+    # mean the portal failed, and the previous split would be thrown away.
+    if config.split_mixed_categories and vod_categories_seen:
+        await _refresh_split_index(headers, split_candidates)
 
     await asyncio.to_thread(_save_cache_to_disk)
 
@@ -807,6 +921,7 @@ async def _build_epg() -> None:
 @app.on_event("startup")
 async def startup() -> None:
     _load_cache_from_disk()
+    _load_split_from_disk()
     _load_epg_from_disk()  # must run before _epg_is_fresh() is checked below
 
     async def _run_background_sync(skip_epg_if_fresh: bool = False):
@@ -832,6 +947,11 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
     action = request.query_params.get("action", "")
     cacheable = request.method == "GET" and action in _CACHEABLE_ACTIONS
     cache_key = _cache_key(upstream_path, request.query_params.multi_items()) if cacheable else None
+
+    if filtered and config.split_mixed_categories and request.method == "GET" and _split_index:
+        js = split.page_response(request.query_params, _split_index, _is_blocked_category)
+        if js is not None:
+            return JSONResponse({"js": js})
 
     if cache_key is not None:
         cached = _listing_cache.get(cache_key)

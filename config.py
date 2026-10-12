@@ -18,6 +18,11 @@ def _parse_name_list(name: str) -> list[str]:
     return [item.strip().lower() for item in os.environ.get(name, "").split(",") if item.strip()]
 
 
+def _parse_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    return default if not raw else raw in ("1", "true", "yes", "on")
+
+
 class Config:
     def __init__(self):
         host_raw = _require("STALKER_HOST").rstrip("/")
@@ -39,6 +44,9 @@ class Config:
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
         self.blocked_category_names = _parse_name_list("BLOCKED_CATEGORY_NAMES")
         self.allowed_category_names = _parse_name_list("ALLOWED_CATEGORY_NAMES")
+        self.split_mixed_categories = _parse_bool("SPLIT_MIXED_CATEGORIES", True)
+        self.split_max_pages = int(os.environ.get("SPLIT_MAX_PAGES", "100"))
+        self.split_crawl_concurrency = int(os.environ.get("SPLIT_CRAWL_CONCURRENCY", "3"))
         self.listing_cache_ttl_seconds = float(os.environ.get("LISTING_CACHE_TTL_SECONDS", "21600"))
         self.prewarm_delay_seconds = float(os.environ.get("PREWARM_DELAY_SECONDS", "0.3"))
         self.prewarm_vod_series_pages = int(os.environ.get("PREWARM_VOD_SERIES_PAGES", "3"))
