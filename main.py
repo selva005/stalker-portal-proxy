@@ -389,7 +389,8 @@ def _upstream_path(request_path: str) -> str:
 
 def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered: bool) -> bytes:
     if action in _CATEGORY_LISTING_ACTIONS:
-        if filtered and req_type == "vod" and config.split_mixed_categories:
+        if req_type == "vod" and config.split_mixed_categories:
+            # Both endpoints: the split only restructures, it hides nothing.
             content = split.add_virtual_categories(content, _split_index)
         content = _mark_adult(content, req_type)
         _update_blocked_category_ids(req_type, content)
@@ -1075,8 +1076,10 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
     cacheable = request.method == "GET" and action in _CACHEABLE_ACTIONS
     cache_key = _cache_key(upstream_path, request.query_params.multi_items()) if cacheable else None
 
-    if filtered and config.split_mixed_categories and request.method == "GET" and _split_index:
-        js = split.page_response(request.query_params, _split_index, _is_blocked_split_title)
+    if config.split_mixed_categories and request.method == "GET" and _split_index:
+        # The block/allow lists only ever apply to the filtered endpoint.
+        is_blocked = _is_blocked_split_title if filtered else (lambda title, category_id: False)
+        js = split.page_response(request.query_params, _split_index, is_blocked)
         if js is not None:
             return JSONResponse({"js": js})
 

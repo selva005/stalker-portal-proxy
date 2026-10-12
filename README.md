@@ -132,13 +132,15 @@ entry, so a mixed category (observed: "KIDS DISNEY+", about a third shows) comes
 placeholder tiles between the entries that render. The data itself is fine; TiviMate opens a
 show's seasons and episodes natively once the show sits in a category it files under TV Shows.
 
-On the filtered endpoint the proxy fixes this by splitting such a category in two: the
+On both the filtered and the `/unfiltered/` endpoint the proxy fixes this by splitting such a
+category in two: the
 original lists only its movies, and a virtual `<name> (SERIES)` category (id = real id +
 1,000,000) lists only its shows. Both are re-sliced into full pages with exact totals, so there
 are no gaps, and nothing is hidden. Only TiviMate's own listing requests are rewritten (default
 order and `sortby=added`); season/episode lookups, search and other sort orders go to the portal
-untouched. `/unfiltered/` is never changed, so apps that handle shows inline keep doing so.
-Allow and block lists apply to both titles.
+untouched. The split only restructures, so `/unfiltered/` still lists everything; but an app on
+it that handles shows inline will now find them in the `(SERIES)` category instead. On the
+filtered endpoint, allow and block lists apply to both titles.
 
 It needs no list of categories. A category counts as mixed when the first pages the background
 sync already pre-warms (`PREWARM_VOD_SERIES_PAGES`, default 3) hold more movies than shows but

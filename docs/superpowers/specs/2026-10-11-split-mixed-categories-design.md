@@ -16,8 +16,8 @@ labels and works).
 
 ## Behaviour
 
-On the **filtered endpoint only** (`/unfiltered/` stays raw, so apps that handle shows inline
-keep doing so):
+On **both endpoints**. The split only restructures and hides nothing, so `/unfiltered/` gets it
+too (an app there that handled shows inline now finds them in the `(SERIES)` category):
 
 - A VOD category whose sample is mostly movies but contains at least one show is *mixed*.
 - The category list gets a virtual copy of each mixed category, titled `<title> (SERIES)`,
@@ -27,7 +27,8 @@ keep doing so):
 - Only requests TiviMate actually sends are rewritten: `type=vod&action=get_ordered_list`
   with `category`, `genre` 0 or absent, `sortby` empty or `added`, and `p`. Anything else
   (`movie_id`, `season_id`, search, other sorts or filters) passes through untouched.
-- Allow/block lists apply to both titles. A blocked category is not rewritten.
+- On the filtered endpoint, allow/block lists apply to both titles, and a blocked category is
+  not rewritten. `/unfiltered/` never applies them.
 
 ## How it is built
 
