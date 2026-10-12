@@ -45,7 +45,8 @@ whole-word names to hide from live TV genre / VOD category / series category lis
 categories are shown; see [Category filtering](#category-filtering)),
 `SPLIT_MIXED_CATEGORIES` (default `true`), `SPLIT_MAX_PAGES` (default `100`),
 `SPLIT_CRAWL_CONCURRENCY` (default `3`) and `SPLIT_PROBE_PAGES` (default `8`), see [Mixed movie and TV-show
-categories](#mixed-movie-and-tv-show-categories),
+categories](#mixed-movie-and-tv-show-categories), `ADULT_CATEGORY_PREFIX` (default `Adult`, see
+[Adult categories](#adult-categories)),
 `LISTING_CACHE_TTL_SECONDS` (default `21600` / 6 hours, how long to cache
 listing responses and how often the background auto-sync re-runs), `PREWARM_DELAY_SECONDS`
 (default `0.3`, delay between requests during auto-sync), `PREWARM_VOD_SERIES_PAGES`
@@ -102,6 +103,26 @@ matches `US|NEWS` (and not `RUS|NEWS`).
   This is the easier option when the list you'd have to block is long, but it also hides
   categories the provider adds later until you add them here.
 - If both are set, a category must match the allowlist and not match the blocklist.
+
+### Adult categories
+
+A category is labelled adult when the portal flags it `censored`, or when entries inside it are
+flagged (observed: a live genre whose own flag says `censored=0` while all of its channels are
+`censored=1`). Its title then gets an `Adult | ` prefix, for example `Adult | ASSAM`, on both
+the filtered and the `/unfiltered/` endpoint. A title that already starts with "Adult" is left
+alone, and the `(SERIES)` copy of a split category gets the prefix too. `ADULT_CATEGORY_PREFIX`
+changes the word; set it to an empty value to turn the labelling off.
+
+The prefix is added before the block and allow lists run, so `BLOCKED_CATEGORY_NAMES=ADULT` now
+hides every adult category on the filtered endpoint, along with its channels and entries,
+without listing them one by one.
+
+Detection costs no extra requests. Live TV looks at every channel, including the ones the portal
+only lists per genre, so it sees all of them. VOD looks at the pages the sync already reads: the
+first pages of every category, the probe pages, and the categories fetched in full for the
+split. A category with a single censored entry deep inside it, in none of those, can be missed.
+The categories found through their entries are saved next to the listing cache
+(`<CACHE_FILE_PATH>.adult.json`) and loaded at startup, so a restart doesn't lose them.
 
 ### Mixed movie and TV-show categories
 

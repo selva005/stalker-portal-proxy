@@ -48,6 +48,8 @@ class Config:
         self.split_max_pages = int(os.environ.get("SPLIT_MAX_PAGES", "100"))
         self.split_crawl_concurrency = int(os.environ.get("SPLIT_CRAWL_CONCURRENCY", "3"))
         self.split_probe_pages = int(os.environ.get("SPLIT_PROBE_PAGES", "8"))
+        # Empty (set but blank) turns the adult prefix off.
+        self.adult_category_prefix = os.environ.get("ADULT_CATEGORY_PREFIX", "Adult").strip()
         self.listing_cache_ttl_seconds = float(os.environ.get("LISTING_CACHE_TTL_SECONDS", "21600"))
         self.prewarm_delay_seconds = float(os.environ.get("PREWARM_DELAY_SECONDS", "0.3"))
         self.prewarm_vod_series_pages = int(os.environ.get("PREWARM_VOD_SERIES_PAGES", "3"))

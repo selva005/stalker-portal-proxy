@@ -21,6 +21,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+import adult
 from config import config
 from epg import EMPTY_XMLTV, build_xmltv
 import split
@@ -84,6 +85,12 @@ _extra_live_channels: list[dict] = []
 # for the filtered endpoint (see split.py), keyed by real category id. Rebuilt by
 # _refresh_split_index on every background sync and persisted next to the listing cache.
 _split_index: dict[str, split.SplitCategory] = {}
+
+# Ids of the categories that hold censored content, by portal type ("itv", "vod", "series"): the
+# ones the portal flags plus the ones whose entries are flagged. Rebuilt by the background sync and
+# persisted, so a restart doesn't drop the entry-derived ones until the next sync. The portal's own
+# category flag needs no state: adult.mark_categories reads it from the listing itself.
+_adult_category_ids: dict[str, set[str]] = {}
 
 # Read-heavy, slow-changing listing actions worth caching to cut down on repeated
 # portal hits from multiple TVs (or repeated app refreshes) requesting the same data.
@@ -163,6 +170,38 @@ def _load_split_from_disk() -> None:
     if _split_index:
         logger.info("Loaded %d split categor%s from %s", len(_split_index),
                     "y" if len(_split_index) == 1 else "ies", _split_file_path())
+
+
+def _adult_file_path() -> str:
+    return config.cache_file_path + ".adult.json"
+
+
+def _load_adult_from_disk() -> None:
+    global _adult_category_ids
+    _adult_category_ids = adult.load(_adult_file_path())
+    if _adult_category_ids:
+        logger.info("Loaded adult category ids (%s) from %s",
+                    ", ".join(f"{t}: {len(ids)}" for t, ids in sorted(_adult_category_ids.items())), _adult_file_path())
+
+
+def _save_adult_to_disk() -> None:
+    try:
+        adult.save(_adult_category_ids, _adult_file_path())
+    except OSError as e:
+        logger.warning("Failed to persist the adult category ids to disk: %s", e)
+
+
+def _mark_adult(content: bytes, req_type: str) -> bytes:
+    """Prefix the adult categories in a category listing (every endpoint, before any filtering)."""
+    resolve = (lambda category_id: split.real_id(category_id) or category_id) if req_type == "vod" else str
+    return adult.mark_categories(content, _adult_category_ids.get(req_type, ()), config.adult_category_prefix, resolve)
+
+
+def _is_blocked_split_title(title: str, real_category_id: str) -> bool:
+    # The split index stores portal titles; the lists see the prefixed ones.
+    if real_category_id in _adult_category_ids.get("vod", ()):
+        title = adult.prefixed(title, config.adult_category_prefix)
+    return _is_blocked_category(title)
 
 
 def _compile_whole_word_patterns(names: list[str]) -> list[re.Pattern]:
@@ -352,6 +391,7 @@ def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered
     if action in _CATEGORY_LISTING_ACTIONS:
         if filtered and req_type == "vod" and config.split_mixed_categories:
             content = split.add_virtual_categories(content, _split_index)
+        content = _mark_adult(content, req_type)
         _update_blocked_category_ids(req_type, content)
         if filtered and _FILTERING_ENABLED:
             return _filter_categories(content)
@@ -667,12 +707,14 @@ async def _refresh_split_index(headers: dict, candidates: list[tuple[str, str]])
         logger.warning("Failed to persist the split index to disk: %s", e)
 
 
-async def _probe_for_shows(headers: dict, probes: list[tuple[str, str, list[dict], int]]) -> list[tuple[str, str]]:
+async def _probe_for_shows(
+    headers: dict, probes: list[tuple[str, str, list[dict], int]]
+) -> tuple[list[tuple[str, str]], set[str]]:
     """Look at pages spread through categories whose first pages held no show.
 
     The pre-warmed sample is only the first few pages; a category whose shows come later (or
     are sparse) would otherwise never be noticed. Returns the (id, title) of those that turn
-    out to be mixed.
+    out to be mixed, and the ids of those where a censored entry turned up.
     """
     gate = asyncio.Semaphore(max(1, config.split_crawl_concurrency))
 
@@ -682,15 +724,18 @@ async def _probe_for_shows(headers: dict, probes: list[tuple[str, str, list[dict
             await asyncio.sleep(config.prewarm_delay_seconds)
             return js["data"] if js else []
 
-    found = []
+    found, censored = [], set()
     for category_id, title, sample, pages in probes:
         extra = await asyncio.gather(
             *(fetch(category_id, page)
               for page in split.probe_pages(pages, config.prewarm_vod_series_pages, config.split_probe_pages))
         )
-        if split.looks_mixed(sample + [item for page_items in extra for item in page_items]):
+        items = sample + [item for page_items in extra for item in page_items]
+        if split.looks_mixed(items):
             found.append((category_id, title))
-    return found
+        if any(adult.is_censored(item) for item in items):
+            censored.add(category_id)
+    return found, censored
 
 
 async def _prewarm_all() -> None:
@@ -720,10 +765,18 @@ async def _prewarm_all() -> None:
         await _discover_per_genre_only_channels(
             headers, live_content["get_genres"], live_content["get_all_channels"]
         )
+        # Genres the portal flags, plus those with a censored channel: the censored ones are left out of
+        # get_all_channels and found by the discovery above, so this sees all of them.
+        _adult_category_ids["itv"] = adult.flagged_categories(live_content["get_genres"]) | adult.censored_ids(
+            _page_items(live_content["get_all_channels"]) + _extra_live_channels, "tv_genre_id"
+        )
+        _update_blocked_category_ids("itv", _mark_adult(live_content["get_genres"], "itv"))
 
     split_candidates: list[tuple[str, str]] = []
     probes: list[tuple[str, str, list[dict], int]] = []
     vod_categories_seen = False
+    catalog_content: dict[str, bytes] = {}
+    adult_found: dict[str, set[str]] = {}
     for req_type, action in _CATALOG_PREWARM_ENDPOINTS:
         content = await _fetch_and_cache(
             headers, [("type", req_type), ("action", action), ("JsHttpRequest", "1-xml")], http=crawl_http
@@ -734,6 +787,8 @@ async def _prewarm_all() -> None:
         if not content:
             continue
         _update_blocked_category_ids(req_type, content)
+        catalog_content[req_type] = content
+        adult_found[req_type] = adult.flagged_categories(content)
         categories = _parse_categories(content)
         for category_id, title in categories:
             sample: list[dict] = []
@@ -755,6 +810,8 @@ async def _prewarm_all() -> None:
                     if page == 1:
                         pages = _page_count(page_content)
                 await asyncio.sleep(config.prewarm_delay_seconds)
+            if any(adult.is_censored(item) for item in sample):
+                adult_found[req_type].add(category_id)
             if req_type == "vod" and split.is_splittable_id(category_id):
                 if split.looks_mixed(sample):
                     split_candidates.append((category_id, title))
@@ -771,13 +828,26 @@ async def _prewarm_all() -> None:
     # Only when the category list was actually fetched: otherwise "no candidates" would just
     # mean the portal failed, and the previous split would be thrown away.
     if config.split_mixed_categories and vod_categories_seen:
-        found = await _probe_for_shows(headers, probes)
+        found, probe_adult = await _probe_for_shows(headers, probes)
+        adult_found["vod"] |= probe_adult
         logger.info(
             "Split detection: %d vod categories look mixed from their first %d pages; probed %d more with no "
             "show there and found %d mixed",
             len(split_candidates), config.prewarm_vod_series_pages, len(probes), len(found),
         )
         await _refresh_split_index(headers, split_candidates + found)
+        # Split categories were fetched in full, so a censored entry anywhere in one is seen.
+        adult_found["vod"] |= {
+            category_id for category_id, entry in _split_index.items()
+            if any(adult.is_censored(item) for item in entry.movies[""] + entry.shows[""])
+        }
+
+    # A type whose category list couldn't be fetched keeps its previous ids.
+    for req_type, ids in adult_found.items():
+        _adult_category_ids[req_type] = ids
+        _update_blocked_category_ids(req_type, _mark_adult(catalog_content[req_type], req_type))
+    await asyncio.to_thread(_save_adult_to_disk)
+    logger.info("Adult categories: %s", ", ".join(f"{t}: {len(ids)}" for t, ids in sorted(_adult_category_ids.items())) or "none")
 
     await asyncio.to_thread(_save_cache_to_disk)
 
@@ -978,6 +1048,7 @@ async def _build_epg() -> None:
 async def startup() -> None:
     _load_cache_from_disk()
     _load_split_from_disk()
+    _load_adult_from_disk()
     _load_epg_from_disk()  # must run before _epg_is_fresh() is checked below
 
     async def _run_background_sync(skip_epg_if_fresh: bool = False):
@@ -1005,7 +1076,7 @@ async def _proxy(request: Request, effective_path: str, filtered: bool) -> Respo
     cache_key = _cache_key(upstream_path, request.query_params.multi_items()) if cacheable else None
 
     if filtered and config.split_mixed_categories and request.method == "GET" and _split_index:
-        js = split.page_response(request.query_params, _split_index, _is_blocked_category)
+        js = split.page_response(request.query_params, _split_index, _is_blocked_split_title)
         if js is not None:
             return JSONResponse({"js": js})
 

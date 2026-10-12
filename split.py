@@ -126,9 +126,14 @@ def add_virtual_categories(content: bytes, index: Mapping[str, SplitCategory]) -
 
 
 def page_response(
-    params: Mapping[str, str], index: Mapping[str, SplitCategory], is_blocked: Callable[[str], bool]
+    params: Mapping[str, str], index: Mapping[str, SplitCategory], is_blocked: Callable[[str, str], bool]
 ) -> dict | None:
-    """The `js` of a re-sliced page for a request on a split category, or None to pass it through."""
+    """The `js` of a re-sliced page for a request on a split category, or None to pass it through.
+
+    `is_blocked(title, real_category_id)` says whether the category as listed (the movies view
+    under its own title, the shows view under "<title> (SERIES)") is hidden by the block/allow
+    lists; a hidden category is passed through so the usual item filtering applies.
+    """
     if params.get("type") != "vod" or params.get("action") != "get_ordered_list":
         return None
     if not set(params) <= _REQUEST_PARAMS:
@@ -146,13 +151,13 @@ def page_response(
         return None
 
     category = params.get("category", "")
-    entry, view = index.get(category), "movies"
+    entry, view, original = index.get(category), "movies", category
     if entry is None:
         original = real_id(category)
         entry, view = (index.get(original) if original else None), "shows"
     if entry is None:
         return None
-    if is_blocked(entry.title if view == "movies" else entry.title + TITLE_SUFFIX):
+    if is_blocked(entry.title if view == "movies" else entry.title + TITLE_SUFFIX, original):
         return None
 
     items = (entry.movies if view == "movies" else entry.shows)[sortby]
