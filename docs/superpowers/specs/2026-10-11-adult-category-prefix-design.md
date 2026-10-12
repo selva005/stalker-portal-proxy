@@ -17,6 +17,11 @@ everything clean in it as soon as `ADULT` is blocked (an earlier version did exa
 - A category with some adult entries keeps its clean entries; the adult ones move to a virtual
   `Adult | <title>` category (id + 2,000,000), and adult shows to `Adult | <title> (SERIES)`
   (id + 3,000,000). See the split design for the views and paging.
+- Entry flags are ignored in a category the portal doesn't flag when most but not all of its entries
+  are flagged (`adult.flags_unreliable`): observed on a "(PG)" anime category with 878 of 1,003
+  entries flagged (Digimon, My Hero Academia). Such a flag is a blanket artifact, not an exception
+  among clean entries. The category is then treated as clean (shows are still split) and the sync
+  logs it. A category with every entry flagged is still adult (live genre ASSAM).
 - Both endpoints. The prefix is added before the block/allow lists run, so
   `BLOCKED_CATEGORY_NAMES=ADULT` hides every adult piece on the filtered endpoint (and, through
   the existing item filtering, its channels and entries) and leaves the clean remainders.
@@ -42,6 +47,8 @@ everything clean in it as soon as `ADULT` is blocked (an earlier version did exa
 
 ## Known limits
 
+- A genuinely adult category that the portal doesn't flag and where most but not all entries are
+  flagged is treated as clean (the flagged majority is not credible by itself).
 - Entries are found through sampled pages (probe), so a category with very few adult entries on
   none of them is not split unless the portal flags it.
 - Splitting mixed live genres relies on recognising the app's per-genre request; one in a shape

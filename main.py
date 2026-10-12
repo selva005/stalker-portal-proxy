@@ -718,6 +718,10 @@ async def _refresh_live_split(
             except split.TooLarge as e:
                 logger.info("Not splitting live genre %r: %s (SPLIT_MAX_PAGES)", title, e)
                 outcome = "big"
+        if outcome == "ok" and adult.flags_unreliable(crawled[1]):
+            logger.info("Ignoring the adult flags in live genre %r: %d of %d channels are flagged but the genre isn't, "
+                        "which looks like a blanket flag", title, sum(1 for c in crawled[1] if adult.is_censored(c)), len(crawled[1]))
+            continue
         if outcome == "ok":
             entry, is_whole = split.build_category(
                 title, {sort: crawled for sort in split.SORTS}, category_adult=False, adult_enabled=True
@@ -781,11 +785,11 @@ def _describe_split(entry: split.SplitCategory, live: bool = False) -> str:
 
 
 async def _refresh_split_index(
-    headers: dict, candidates: list[tuple[str, str, bool]], adult_enabled: bool
+    headers: dict, candidates: list[tuple[str, str, bool, list[dict]]], adult_enabled: bool
 ) -> tuple[set[str], set[str]]:
     """Crawl each candidate category and replace the split index with the result.
 
-    Candidates are (id, title, flagged_by_portal). Returns (whole_adult, crawled): the ids found
+    Candidates are (id, title, flagged_by_portal, the sample that made it a candidate). Returns (whole_adult, crawled): the ids found
     to be entirely adult, and the ids whose crawl succeeded (the authoritative ones). A category
     whose crawl fails keeps its previous entry and adult status, so a transient portal hiccup
     doesn't bring the blank tiles back; one that no longer needs a split is dropped.
@@ -794,7 +798,7 @@ async def _refresh_split_index(
     fresh: dict[str, split.SplitCategory] = {}
     whole_adult: set[str] = set()
     crawled_ok: set[str] = set()
-    for category_id, title, flagged in candidates:
+    for category_id, title, flagged, sample in candidates:
         crawls = {}
         try:
             for sortby in split.SORTS:
@@ -808,10 +812,20 @@ async def _refresh_split_index(
                     break
                 crawls[sortby] = crawled
         except split.TooLarge as e:
-            logger.info("Not splitting %r: %s (SPLIT_MAX_PAGES)", title, e)
+            logger.info(
+                "Not splitting %r: %s (SPLIT_MAX_PAGES); of the %d entries sampled %d are shows and %d adult",
+                title, e, len(sample), sum(1 for item in sample if split.is_show(item)),
+                sum(1 for item in sample if adult_enabled and adult.is_censored(item)),
+            )
             continue
         if len(crawls) == len(split.SORTS):
-            entry, whole = split.build_category(title, crawls, category_adult=flagged, adult_enabled=adult_enabled)
+            trust_flags = adult_enabled
+            if adult_enabled and not flagged and adult.flags_unreliable(crawls[split.SORTS[0]][1]):
+                entries = crawls[split.SORTS[0]][1]
+                logger.info("Ignoring the adult flags in %r: %d of %d entries are flagged but the category isn't, "
+                            "which looks like a blanket flag", title, sum(1 for e in entries if adult.is_censored(e)), len(entries))
+                trust_flags = False
+            entry, whole = split.build_category(title, crawls, category_adult=flagged, adult_enabled=trust_flags)
             crawled_ok.add(category_id)
             if whole:
                 whole_adult.add(category_id)
@@ -907,7 +921,7 @@ async def _prewarm_all() -> None:
         ))
         titles_by_type_live = dict(_parse_categories(live_content["get_genres"]))
 
-    candidates: list[tuple[str, str, bool]] = []  # (id, title, flagged by the portal)
+    candidates: list[tuple[str, str, bool, list[dict]]] = []  # (id, title, flagged by the portal, sample)
     all_adult_in_sample: set[str] = set()
     probes: list[tuple[str, str, list[dict], int]] = []
     vod_categories_seen = False
@@ -955,9 +969,9 @@ async def _prewarm_all() -> None:
                 if has_adult and all(adult.is_censored(item) for item in sample):
                     all_adult_in_sample.add(category_id)
                 if split.looks_mixed(sample) or (has_adult and not flagged):
-                    candidates.append((category_id, title, flagged))
+                    candidates.append((category_id, title, flagged, sample))
                 elif (not flagged and not has_adult and not any(split.is_show(item) for item in sample)
-                      and config.prewarm_vod_series_pages < pages <= config.split_max_pages):
+                      and config.prewarm_vod_series_pages < pages <= config.split_probe_max_pages):
                     probes.append((category_id, title, sample, pages))
         if req_type == "vod":
             vod_categories_seen = True
@@ -974,7 +988,7 @@ async def _prewarm_all() -> None:
         if config.split_mixed_categories:
             found = await _probe_for_mixed(headers, probes, adult_enabled)
             for category_id, title, items in found:
-                candidates.append((category_id, title, False))
+                candidates.append((category_id, title, False, items))
                 if adult_enabled and all(adult.is_censored(item) for item in items):
                     all_adult_in_sample.add(category_id)
             logger.info(

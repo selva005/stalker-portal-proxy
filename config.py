@@ -48,6 +48,9 @@ class Config:
         self.split_max_pages = int(os.environ.get("SPLIT_MAX_PAGES", "100"))
         self.split_crawl_concurrency = int(os.environ.get("SPLIT_CRAWL_CONCURRENCY", "3"))
         self.split_probe_pages = int(os.environ.get("SPLIT_PROBE_PAGES", "8"))
+        # Probing is cheap (SPLIT_PROBE_PAGES requests), so it reaches much bigger categories than the
+        # full fetch does: that is how a big mixed category gets reported even though it is not split.
+        self.split_probe_max_pages = int(os.environ.get("SPLIT_PROBE_MAX_PAGES", "5000"))
         # Empty (set but blank) turns the adult prefix off.
         self.adult_category_prefix = os.environ.get("ADULT_CATEGORY_PREFIX", "Adult").strip()
         self.listing_cache_ttl_seconds = float(os.environ.get("LISTING_CACHE_TTL_SECONDS", "21600"))

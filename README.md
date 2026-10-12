@@ -44,7 +44,8 @@ whole-word names to hide from live TV genre / VOD category / series category lis
 `ADULT,XXX`), `ALLOWED_CATEGORY_NAMES` (allowlist, same matching — when set, only matching
 categories are shown; see [Category filtering](#category-filtering)),
 `SPLIT_MIXED_CATEGORIES` (default `true`), `SPLIT_MAX_PAGES` (default `100`),
-`SPLIT_CRAWL_CONCURRENCY` (default `3`) and `SPLIT_PROBE_PAGES` (default `8`), see [Mixed movie and TV-show
+`SPLIT_CRAWL_CONCURRENCY` (default `3`), `SPLIT_PROBE_PAGES` (default `8`) and
+`SPLIT_PROBE_MAX_PAGES` (default `5000`), see [Mixed movie and TV-show
 categories](#mixed-movie-and-tv-show-categories), `ADULT_CATEGORY_PREFIX` (default `Adult`, see
 [Adult categories](#adult-categories)),
 `LISTING_CACHE_TTL_SECONDS` (default `21600` / 6 hours, how long to cache
@@ -117,6 +118,13 @@ turns the labelling and the adult split off).
 - A category that is only **partly adult** is split: the adult entries move to their own
   `Adult | <title>` category and the original keeps the rest.
 
+The portal's entry flag is not always credible: one "(PG)" anime category had 878 of its 1,003
+entries (Digimon, My Hero Academia...) flagged `censored` while the category itself wasn't. Genuine
+adult entries in a mixed category are the exception among clean ones, so when most but not all of a
+category's entries are flagged and the category isn't, the entry flags in it are ignored: no adult
+split and no prefix there (shows are still split). The sync logs `Ignoring the adult flags in ...`
+with the counts for each. A category where every entry is flagged is still taken at its word.
+
 **Shows in movie categories.** Some portals put TV shows (`is_series=1`) in ordinary VOD categories.
 TiviMate files each category under Movies or TV Shows and can't draw the other kind of entry, so
 a mixed category (observed: "KIDS DISNEY+", about a third shows) comes out with blank placeholder
@@ -143,10 +151,14 @@ favourites filters and other sort orders go to the portal untouched.
 
 **How they are found.** No list of categories is needed. For VOD, the first pages the background
 sync already pre-warms (`PREWARM_VOD_SERIES_PAGES`, default 3) are checked for shows and adult
-entries; a category with neither, of at most `SPLIT_MAX_PAGES` pages, gets `SPLIT_PROBE_PAGES`
-(default 8) more pages spread evenly through it (all of them if it has fewer), because both are
-often sparse. A category that shows up is then fetched in full, `SPLIT_CRAWL_CONCURRENCY` pages at
-a time, in each sync (the default order and `added`), so the split is exact. Within the clean and
+entries; a category with neither, of at most `SPLIT_PROBE_MAX_PAGES` pages (default 5000), gets
+`SPLIT_PROBE_PAGES` (default 8) more pages spread evenly through it (all of them if it has fewer),
+because both are often sparse. A category that shows up is then fetched in full if it has at most
+`SPLIT_MAX_PAGES` pages (default 100), `SPLIT_CRAWL_CONCURRENCY` pages at a time, in each sync (the
+default order and `added`), so the split is exact. A bigger one is only reported in the log, with
+what its sample held (`Not splitting 'X': 629 pages ...; of the 154 entries sampled 3 are shows
+and 0 adult`), because fetching it in full costs a page per 14 entries in two orders and keeps
+every entry in memory. Within the clean and
 the adult group, shows are split off when that group is mostly movies with at least one show. The
 result is only used if every page arrived and the entries add up to the portal's own total;
 otherwise the previous result is kept, or the category is served as before.

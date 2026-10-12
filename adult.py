@@ -20,6 +20,19 @@ def is_censored(entry) -> bool:
     return isinstance(entry, dict) and entry.get("censored") in (1, "1", True)
 
 
+def flags_unreliable(entries: list) -> bool:
+    """True when most but not all entries are flagged: that looks like a blanket flag.
+
+    Observed: a "(PG)" anime category whose entries (Digimon, My Hero Academia...) are mostly
+    flagged `censored` although the category isn't. Genuine adult entries in a mixed category are
+    the exception among clean ones, so a flagged majority is not credible. A category where all
+    entries are flagged is still taken at its word (live genre ASSAM).
+    """
+    if not entries:
+        return False
+    return 0.5 < sum(1 for entry in entries if is_censored(entry)) / len(entries) < 1
+
+
 def _categories(content: bytes) -> list | None:
     try:
         data = json.loads(content)
