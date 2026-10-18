@@ -445,8 +445,8 @@ def _apply_filter_if_needed(content: bytes, req_type: str, action: str, filtered
     if remap_adult:
         for item in items:
             entry = _live_split_index.get(str(item.get("tv_genre_id")))
-            if entry is not None and "adult_movies" in entry.buckets and adult.is_censored(item):
-                new_id = split.virtual_id(str(item["tv_genre_id"]), "adult_movies")
+            if entry is not None and "adult_main" in entry.buckets and adult.is_censored(item):
+                new_id = split.virtual_id(str(item["tv_genre_id"]), "adult_main")
                 item["tv_genre_id"] = new_id if isinstance(item["tv_genre_id"], str) else int(new_id)
                 changed = True
     if blocked_ids:
@@ -777,9 +777,11 @@ async def _fetch_listing_page(headers: dict, category_id: str, sortby: str, page
 
 
 def _describe_split(entry: split.SplitCategory, live: bool = False) -> str:
+    kinds = ("shows", "movies") if entry.shows_primary else ("movies", "shows")
+    names = {"main": kinds[0], "other": kinds[1], "adult_main": f"adult {kinds[0]}", "adult_other": f"adult {kinds[1]}"}
     views = ", ".join(
-        f"{len(by_sort[''])} {name.replace('movies', 'channels' if live else 'movies').replace('_', ' ')}"
-        for name, by_sort in entry.buckets.items()
+        f"{len(by_sort[''])} {names[role].replace('movies', 'channels' if live else 'movies')}"
+        for role, by_sort in entry.buckets.items()
     )
     return f"{entry.title} ({views}{'; whole category adult' if entry.adult else ''})"
 
@@ -858,11 +860,12 @@ async def _refresh_split_index(
 async def _probe_for_mixed(
     headers: dict, probes: list[tuple[str, str, list[dict], int]], adult_enabled: bool
 ) -> list[tuple[str, str, list[dict]]]:
-    """Look at pages spread through categories whose first pages held no show and nothing adult.
+    """Look at pages spread through categories whose first pages were a single kind and not adult.
 
-    The pre-warmed sample is only the first few pages; a category whose shows or adult entries
-    come later (or are sparse) would otherwise never be noticed. Returns (id, title, everything
-    seen) for those that turn out to hold shows (mostly movies) or adult entries.
+    The pre-warmed sample is only the first few pages; a category whose other kind (a stray movie
+    in a show category, shows in a movie one) or adult entries come later, or are sparse, would
+    otherwise never be noticed. Returns (id, title, everything seen) for those that turn out to
+    hold both kinds or adult entries.
     """
     gate = asyncio.Semaphore(max(1, config.split_crawl_concurrency))
 
@@ -970,7 +973,7 @@ async def _prewarm_all() -> None:
                     all_adult_in_sample.add(category_id)
                 if split.looks_mixed(sample) or (has_adult and not flagged):
                     candidates.append((category_id, title, flagged, sample))
-                elif (not flagged and not has_adult and not any(split.is_show(item) for item in sample)
+                elif (not flagged and not has_adult
                       and config.prewarm_vod_series_pages < pages <= config.split_probe_max_pages):
                     probes.append((category_id, title, sample, pages))
         if req_type == "vod":

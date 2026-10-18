@@ -19,14 +19,16 @@ labels and works).
 On **both endpoints**. The split only restructures and hides nothing, so `/unfiltered/` gets it
 too (an app there that handled shows inline now finds them in the `(SERIES)` category):
 
-- A VOD category whose sample is mostly movies but contains at least one show is *mixed*; so is
+- A VOD category whose sample holds both shows and movies, in any proportion, is *mixed*; so is
   one whose sample holds adult entries (`censored`), which are split out the same way.
-- The category list gets virtual copies of each mixed category (every other field copied): shows
-  as `<title> (SERIES)` (id + 1,000,000), and, see the adult design, adult movies as
-  `Adult | <title>` (id + 2,000,000) and adult shows as `Adult | <title> (SERIES)` (id + 3,000,000).
-- The original category lists only its clean movies; each virtual one lists its own entries. All
-  are re-sliced to the portal's page size with an exact `total_items`, so there are no gaps. Shows
-  are split off a group (clean or adult) only when it is mostly movies with at least one show.
+- The original keeps the *primary kind*: movies, unless the title says "series" (whole word), then
+  shows. The other kind moves to a virtual copy of the category (every other field copied):
+  `<title> (SERIES)` (id + 1,000,000), or for a series-named category the title with SERIES swapped
+  for MOVIES (a movies category must not say "series": TiviMate may file by name). Adult entries go
+  to `Adult | <title>` (id + 2,000,000) and their other kind to id + 3,000,000. Observed: "HINDI
+  INDIAN SERIES (18+)" is 361 shows and 87 movies.
+- Each view holds a single kind and is re-sliced to the portal's page size with an exact
+  `total_items`, so there are no gaps. A group (clean or adult) is split whenever it holds both kinds.
 - Only requests TiviMate actually sends are rewritten: `type=vod&action=get_ordered_list`
   with `category`, `genre` 0 or absent, `sortby` empty or `added`, and `p`. Anything else
   (`movie_id`, `season_id`, search, other sorts or filters) passes through untouched.
@@ -37,7 +39,7 @@ too (an app there that handled shows inline now finds them in the `(SERIES)` cat
 
 - **Detection** starts from the pages the background sync already pre-warms (first
   `PREWARM_VOD_SERIES_PAGES`, default 3, of every category). A category of at most
-  `SPLIT_MAX_PAGES` pages with no show there is probed: `SPLIT_PROBE_PAGES` (default 8) more
+  `SPLIT_MAX_PAGES` pages whose sample is a single kind is probed: `SPLIT_PROBE_PAGES` (default 8) more
   pages spread evenly through it (all of them if fewer), because shows are often sparse
   (observed: 29 of 506 entries, none before page 4). A few hundred extra requests per sync.
 - **Crawl** of each mixed category of at most `SPLIT_MAX_PAGES` (default 100) pages happens in
@@ -59,8 +61,7 @@ too (an app there that handled shows inline now finds them in the `(SERIES)` cat
 
 ## Known limits
 
-- A category whose shows are so rare that the probe pages miss them is not detected.
+- A category whose other kind is so rare that the probe pages miss it is not detected.
 - Categories over the page cap, such as one with 8,806 items, are not split.
-- Series-named categories with a few stray movies are not covered.
 - That TiviMate files the virtual category under TV Shows is expected (all shows, named
   "SERIES", so either a name-based or content-based rule fits) but unverified.

@@ -131,15 +131,22 @@ a mixed category (observed: "KIDS DISNEY+", about a third shows) comes out with 
 tiles. TiviMate opens a show's seasons and episodes natively once the show sits in a category it
 files under TV Shows, so the shows are split out too.
 
-A category can therefore become up to four, with only the non-empty ones listed. Every one is
-re-sliced into full pages with exact totals, so there are no gaps, and nothing is hidden:
+A category can therefore become up to four, with only the non-empty ones listed. Every one holds a
+single kind, is re-sliced into full pages with exact totals, so there are no gaps, and nothing is
+hidden. The original keeps the kind its name promises: movies, unless the name says "series" (a
+whole word), then shows. The other kind moves out:
 
 | view | id | title | holds |
 |---|---|---|---|
-| original | the real id | `<title>` | clean movies (live: clean channels) |
-| shows | id + 1,000,000 | `<title> (SERIES)` | clean shows |
-| adult movies | id + 2,000,000 | `Adult \| <title>` | adult movies (live: adult channels) |
-| adult shows | id + 3,000,000 | `Adult \| <title> (SERIES)` | adult shows |
+| original | the real id | `<title>` | clean entries of the primary kind (live: clean channels) |
+| other | id + 1,000,000 | `<title> (SERIES)`, or for a series-named category the title with SERIES swapped for MOVIES | clean entries of the other kind |
+| adult | id + 2,000,000 | `Adult \| <title>` | adult entries of the primary kind (live: adult channels) |
+| adult other | id + 3,000,000 | `Adult \| <title> (SERIES)` or `Adult \| <title with MOVIES>` | adult entries of the other kind |
+
+So `HINDI INDIAN SERIES (18+)`, which has 361 shows and 87 movies, keeps its shows and gets a separate
+`HINDI INDIAN MOVIES (18+)` for the movies (both prefixed `Adult | ` when the portal flags the
+category). The word is swapped, not suffixed, because TiviMate may file a category by its name and
+a movies category should not say "series".
 
 Both endpoints get this, filtered and `/unfiltered/`. On the filtered endpoint the prefix is added
 before the block and allow lists run, so `BLOCKED_CATEGORY_NAMES=ADULT` hides every adult piece
@@ -151,16 +158,16 @@ favourites filters and other sort orders go to the portal untouched.
 
 **How they are found.** No list of categories is needed. For VOD, the first pages the background
 sync already pre-warms (`PREWARM_VOD_SERIES_PAGES`, default 3) are checked for shows and adult
-entries; a category with neither, of at most `SPLIT_PROBE_MAX_PAGES` pages (default 5000), gets
+entries; a category whose sample is a single kind and not adult, of at most `SPLIT_PROBE_MAX_PAGES` pages (default 5000), gets
 `SPLIT_PROBE_PAGES` (default 8) more pages spread evenly through it (all of them if it has fewer),
 because both are often sparse. A category that shows up is then fetched in full if it has at most
 `SPLIT_MAX_PAGES` pages (default 100), `SPLIT_CRAWL_CONCURRENCY` pages at a time, in each sync (the
 default order and `added`), so the split is exact. A bigger one is only reported in the log, with
 what its sample held (`Not splitting 'X': 629 pages ...; of the 154 entries sampled 3 are shows
 and 0 adult`), because fetching it in full costs a page per 14 entries in two orders and keeps
-every entry in memory. Within the clean and
-the adult group, shows are split off when that group is mostly movies with at least one show. The
-result is only used if every page arrived and the entries add up to the portal's own total;
+every entry in memory. Within the clean and the adult group, a group that holds
+both kinds is split whatever the proportion, so a category of mostly shows with a few movies, or the
+reverse, comes out pure. The result is only used if every page arrived and the entries add up to the portal's own total;
 otherwise the previous result is kept, or the category is served as before.
 
 Live TV comes as one list that apps group by `tv_genre_id`, so a mixed genre is handled in both
@@ -178,8 +185,15 @@ sampled in it is censored).
 
 Limits: a category whose shows or adult entries are very rare (a few percent or less) can slip past
 the probe; a category over the page cap can't be split (the prefix still applies if the portal flags
-it or all its sampled entries are censored); a show-heavy category keeps its few movies in place;
-and a live request in a shape the proxy doesn't recognise is passed to the portal as it is.
+it or all its sampled entries are censored); and a live request in a shape the proxy doesn't recognise is passed to the portal as it is.
+
+### Tests
+
+Plain scripts, no extra dependencies (they need `httpx`, which the app already installs): run each
+with `python3 tests/<name>.py`. `test_split_unit.py` and `test_adult_unit.py` cover the pure logic,
+`test_sync_e2e.py` runs the real background sync against a mock portal and drives the app over HTTP,
+and `test_filters_and_live.py` covers the block/allow lists, the HD flag and the per-genre-only live
+channels.
 
 ### EPG
 
